@@ -20,6 +20,7 @@ from lychee_client.planner import (
     MapProfile,
     MIN_RESOURCE_NET_VALUE,
     MIN_TASK_NET_VALUE,
+    TaskSequencePlan,
     build_global_plan,
     estimate_delivery_route,
     resource_net_value,
@@ -39,6 +40,8 @@ from lychee_client.state import (
     TASK_SCORE_TARGET, TASK_SCORE_STRETCH, MAX_TASK_DETOUR_COST,
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
     RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY,
+    MAX_ROUND, REF_EARLY_TASK_FORCE, REF_FORCE_DELIVERY_FALLBACK,
+    REF_LATE_RESOURCE_CUTOFF, match_phase_round,
 )
 from lychee_client.decision import (
     make_action, make_move_action, make_wait_action,
@@ -122,6 +125,7 @@ def decide_action(
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
     map_profile: MapProfile | None = None,
+    max_round: int = MAX_ROUND,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -161,7 +165,7 @@ def decide_action(
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
-            forced_pass_failed_targets, map_profile,
+            forced_pass_failed_targets, map_profile, max_round,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -199,6 +203,7 @@ def _decide_action_impl(
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
     map_profile: MapProfile | None = None,
+    max_round: int = MAX_ROUND,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -243,8 +248,12 @@ def _decide_action_impl(
         round_num, player, graph, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids, route_blocked,
         obstacle_nodes, all_players, player_id, phase, map_profile,
+        tasks=tasks,
+        failed_task_ids=failed_task_ids,
+        visited_node_ids=visited_node_ids,
+        max_round=max_round,
     )
-    force_delivery = _should_force_delivery(round_num, phase, player, global_plan)
+    force_delivery = _should_force_delivery(round_num, phase, player, global_plan, max_round)
 
     if is_in_limited_state(player):
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
@@ -504,6 +513,7 @@ def _decide_action_impl(
             processed_node_ids=processed_node_ids,
             inquire_nodes=inquire_nodes,
             map_profile=map_profile,
+            max_round=max_round,
         )
         if resource_action is not None:
             return resource_action
@@ -709,15 +719,18 @@ def _should_force_delivery(
     phase: str,
     player: dict,
     global_plan: GlobalPlan | None = None,
+    max_round: int = MAX_ROUND,
 ) -> bool:
     """Stop optional scoring once delivery risk is higher than task/resource value."""
     if global_plan is not None:
         return global_plan.should_force_delivery
     if phase == "RUSH":
         return True
-    if round_num >= 95 and get_task_score(player) >= 60:
+    early_task_force = match_phase_round(max_round, REF_EARLY_TASK_FORCE)
+    force_fallback = match_phase_round(max_round, REF_FORCE_DELIVERY_FALLBACK)
+    if round_num >= early_task_force and get_task_score(player) >= 60:
         return True
-    if round_num >= 175:
+    if round_num >= force_fallback:
         return True
     return False
 
@@ -1379,6 +1392,88 @@ def _retry_task_at_current_node(
     return make_action(match_id, round_num, player_id, [make_claim_task_action(task_id)])
 
 
+def _move_toward_planned_task(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    graph: MapGraph,
+    current_node_id: str,
+    tasks: list[dict],
+    seq: TaskSequencePlan,
+    my_player_id: int,
+    weather: dict | None,
+    blocked: set[str] | None,
+    obstacle_nodes: set[str] | None,
+    visited_node_ids: set[str] | None,
+    failed_task_ids: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> dict | None:
+    """Follow the first step of the rolling multi-task sequence plan."""
+    if obstacle_nodes is None:
+        obstacle_nodes = set()
+    if visited_node_ids is None:
+        visited_node_ids = set()
+    if failed_task_ids is None:
+        failed_task_ids = set()
+
+    target_task: dict | None = None
+    for task in tasks:
+        task_id = task.get("taskId", "")
+        if task_id and task_id == seq.next_task_id:
+            target_task = task
+            break
+    if target_task is None:
+        for task in tasks:
+            if task.get("nodeId", "") == seq.next_task_node:
+                target_task = task
+                break
+    if target_task is None:
+        return None
+
+    if not target_task.get("active", False) or target_task.get("completed", False) or target_task.get("failed", False):
+        return None
+    owner = target_task.get("ownerPlayerId", 0)
+    if owner not in (0, my_player_id):
+        return None
+    protection = target_task.get("protectionPlayerId", 0)
+    if protection not in (0, my_player_id):
+        return None
+    if target_task.get("taskId", "") in failed_task_ids:
+        return None
+
+    task_node = seq.next_task_node
+    if not task_node or task_node == current_node_id:
+        return None
+
+    soft_blocked = set(obstacle_nodes)
+    soft_blocked.update(visited_node_ids)
+    soft_blocked.discard(task_node)
+    step = graph.next_step_toward(
+        current_node_id, task_node, weather, soft_blocked,
+        use_weighted=True, process_nodes=process_nodes,
+    )
+    if not step:
+        step = graph.next_step_toward(
+            current_node_id, task_node, weather, obstacle_nodes,
+            use_weighted=True, process_nodes=process_nodes,
+        )
+    if not step:
+        return None
+
+    logger.info(
+        "Round %d: Following task sequence toward %s (template=%s), step=%s "
+        "seq=%s net=%.1f horizon=%.0f",
+        round_num,
+        task_node,
+        get_task_template_id(target_task),
+        step,
+        list(seq.task_nodes),
+        seq.net_value,
+        seq.horizon,
+    )
+    return make_action(match_id, round_num, player_id, [make_move_action(step)])
+
+
 def _handle_tasks(
     match_id: str, round_num: int, player_id: int,
     player: dict, graph: MapGraph, current_node_id: str,
@@ -1469,6 +1564,17 @@ def _handle_tasks(
 
     # Look for nearby tasks within detour cost (策略文档 §5.2 顺路原则)
     if my_task_score < TASK_SCORE_TARGET:
+        # Prefer the rolling multi-task sequence plan when available.
+        if global_plan and global_plan.task_sequence:
+            seq = global_plan.task_sequence
+            planned_action = _move_toward_planned_task(
+                match_id, round_num, player_id, graph, current_node_id,
+                tasks, seq, player_id, weather, blocked, obstacle_nodes,
+                visited_node_ids, failed_task_ids, process_nodes,
+            )
+            if planned_action is not None:
+                return planned_action
+
         candidates = []
         for task in tasks:
             if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
@@ -1514,6 +1620,14 @@ def _handle_tasks(
                     task_net_value(task, detour, round_num, global_plan, is_current_node=False)
                     if global_plan else spr - detour
                 )
+                if global_plan and global_plan.task_sequence:
+                    seq = global_plan.task_sequence
+                    task_id = task.get("taskId", "")
+                    task_node = task.get("nodeId", "")
+                    if task_id == seq.next_task_id or task_node == seq.next_task_node:
+                        net_value += 20.0
+                    elif task_node in seq.task_nodes:
+                        net_value += 8.0
                 if net_value >= MIN_TASK_NET_VALUE:
                     candidates.append((task, detour, net_value))
 
@@ -1579,6 +1693,7 @@ def _handle_resources(
     processed_node_ids: set[str] | None = None,
     inquire_nodes: list[dict] | None = None,
     map_profile: MapProfile | None = None,
+    max_round: int = MAX_ROUND,
 ) -> dict | None:
     """Handle resource claiming strategy (策略文档 §6).
 
@@ -1586,7 +1701,8 @@ def _handle_resources(
     """
     if current_node is None:
         return None
-    if phase == "RUSH" or round_num >= 360:
+    late_resource_cutoff = match_phase_round(max_round, REF_LATE_RESOURCE_CUTOFF)
+    if phase == "RUSH" or round_num >= late_resource_cutoff:
         return None
 
     resources = find_available_resources(current_node)

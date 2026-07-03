@@ -11,7 +11,7 @@ from lychee_client.transport import encode_frame, read_frames_from_buffer
 from lychee_client.messages import parse_message, StartMessage, InquireMessage, OverMessage
 from lychee_client.map_graph import MapGraph
 from lychee_client.planner import MapProfile, build_map_profile
-from lychee_client.state import can_move, get_current_node_id, needs_processing
+from lychee_client.state import can_move, get_current_node_id, needs_processing, MAX_ROUND
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
 
@@ -56,6 +56,7 @@ class GameClient:
         self.guard_stuck_rounds: int = 0
         self.last_node_id: str = ""
         self.start_round: int = 1
+        self.max_round: int = MAX_ROUND
         self.running = False
 
     def connect(self) -> None:
@@ -117,6 +118,7 @@ class GameClient:
         """Handle start message: cache match info and build map graph."""
         self.match_id = start.match_id
         self.start_round = start.round
+        self.max_round = start.duration_round or MAX_ROUND
         self.start_msg = start
         self.graph = MapGraph(start.nodes, start.edges)
 
@@ -151,8 +153,8 @@ class GameClient:
             nodes=start.nodes,
             resources=start.resources,
         )
-        logger.info("Received start: matchId=%s, %d nodes, %d edges, %d process nodes",
-                     start.match_id, len(start.nodes), len(start.edges), len(self.process_nodes))
+        logger.info("Received start: matchId=%s, maxRound=%d, %d nodes, %d edges, %d process nodes",
+                     start.match_id, self.max_round, len(start.nodes), len(start.edges), len(self.process_nodes))
 
     def send_ready(self) -> None:
         """Send ready message."""
@@ -457,6 +459,7 @@ class GameClient:
             pending_task_hold_until_round=self.pending_task_hold_until_round,
             forced_pass_failed_targets=self.forced_pass_failed_targets,
             map_profile=self.map_profile,
+            max_round=self.max_round,
         )
 
         self.send_message(action_msg)

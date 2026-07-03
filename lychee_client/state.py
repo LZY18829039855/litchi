@@ -43,6 +43,20 @@ ICE_BOX_FRESHNESS_THRESHOLD = 72
 RUSH_PROTECT_FRESHNESS = 50
 INTEL_MAX_DISTANCE = 15
 
+# Match duration is fixed at 600 rounds (rulebook §1, protocol durationRound).
+MAX_ROUND = 600
+# Reference timeline markers on the 600-frame strategy doc (§2).
+REF_EARLY_TASK_FORCE = 95
+REF_FORCE_DELIVERY_FALLBACK = 175
+REF_LATE_RESOURCE_CUTOFF = 360
+REF_RUSH_PHASE = 390
+REF_RUSH_FORCE = 450
+
+
+def match_phase_round(max_round: int, ref_round: int) -> int:
+    """Scale a reference-frame milestone onto the actual match length."""
+    return max(1, max_round * ref_round // MAX_ROUND)
+
 
 def get_team_id(player: dict) -> str:
     return player.get("teamId", "")

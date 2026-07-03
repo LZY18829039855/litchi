@@ -8,19 +8,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from itertools import permutations
 from math import isinf
 
 from lychee_client.map_graph import MapGraph, PROCESS_COST_FRAMES
 from lychee_client.state import (
+    MAX_ROUND,
     TASK_PRIORITY,
+    TASK_SCORE_TARGET,
     get_current_node_id,
     get_freshness,
     get_good_fruit,
     get_player_resources,
     get_task_score,
     get_task_template_id,
-    get_team_id,
     has_resource,
+    get_team_id,
     is_delivered,
     is_enemy_guard,
     is_verified,
@@ -29,7 +32,6 @@ from lychee_client.state import (
 
 logger = logging.getLogger("lychee_client.planner")
 
-MAX_ROUND = 600
 SAFE_DELIVERY_BUFFER = 90
 MIN_TASK_NET_VALUE = 8.0
 MIN_RESOURCE_NET_VALUE = 6.0
@@ -37,6 +39,10 @@ MIN_RESOURCE_NET_VALUE = 6.0
 # route. Obstacles are NOT impassable: treating a choke-point block as unreachable
 # would inflate the delivery ETA to infinity and wrongly trigger force-delivery.
 OBSTACLE_TRAVERSAL_PENALTY = 15.0
+# Rolling tactical window: evaluate multi-task routes within this frame budget.
+DEFAULT_PLANNING_HORIZON = 18.0
+MAX_SEQUENCE_TASKS = 3
+MAX_SEQUENCE_PERMUTE = 4
 
 RESOURCE_BASE_VALUE = {
     "FAST_HORSE": 28.0,
@@ -79,6 +85,21 @@ class MapProfile:
 
 
 @dataclass(frozen=True)
+class TaskSequencePlan:
+    """Short-horizon multi-task route plan (15-20 frame rolling window)."""
+    task_ids: tuple[str, ...]
+    task_nodes: tuple[str, ...]
+    total_score: int
+    total_cost: float
+    extra_delivery_cost: float
+    net_value: float
+    next_task_id: str
+    next_task_node: str
+    horizon: float
+    reason: str
+
+
+@dataclass(frozen=True)
 class GlobalPlan:
     round_num: int
     direct_eta: float
@@ -91,6 +112,7 @@ class GlobalPlan:
     resource_weight: float
     combat_weight: float
     reason: str
+    task_sequence: TaskSequencePlan | None = None
 
 
 def build_global_plan(
@@ -108,6 +130,10 @@ def build_global_plan(
     player_id: int,
     phase: str,
     map_profile: MapProfile | None = None,
+    tasks: list[dict] | None = None,
+    failed_task_ids: set[str] | None = None,
+    visited_node_ids: set[str] | None = None,
+    max_round: int = MAX_ROUND,
 ) -> GlobalPlan:
     """Build a compact global plan used by the rule-based executor."""
     current = get_current_node_id(player) or ""
@@ -133,7 +159,7 @@ def build_global_plan(
     opp_score = float(opponent.get("totalScore", 0) or 0) if opponent else my_score
     score_gap = my_score - opp_score
     task_gap = get_task_score(player) - (get_task_score(opponent) if opponent else get_task_score(player))
-    rounds_left = MAX_ROUND - round_num
+    rounds_left = max_round - round_num
     safe_buffer = SAFE_DELIVERY_BUFFER
     if map_profile and map_profile.favors_water:
         safe_buffer -= 12
@@ -148,7 +174,7 @@ def build_global_plan(
     # instead of a fixed round number, so short maps keep a long task window while
     # long maps commit to delivery earlier.
     route_budget = map_profile.best_route_cost if map_profile else max(direct_eta, 300.0)
-    task_window_deadline = MAX_ROUND - route_budget - safe_buffer * 0.5
+    task_window_deadline = max_round - route_budget - safe_buffer * 0.5
 
     should_force = (
         phase == "RUSH"
@@ -194,6 +220,32 @@ def build_global_plan(
     if not reason_parts:
         reason_parts.append("balanced")
 
+    task_sequence: TaskSequencePlan | None = None
+    if (
+        not should_force
+        and phase != "RUSH"
+        and get_task_score(player) < TASK_SCORE_TARGET
+        and tasks
+    ):
+        task_sequence = build_task_sequence_plan(
+            round_num=round_num,
+            player=player,
+            graph=graph,
+            gate_node_id=gate_node_id,
+            terminal_node_ids=terminal_node_ids,
+            weather=weather,
+            blocked_nodes=blocked,
+            process_nodes=process_nodes,
+            tasks=tasks,
+            player_id=player_id,
+            failed_task_ids=failed_task_ids or set(),
+            visited_node_ids=visited_node_ids or set(),
+            obstacle_nodes=obstacle_nodes or set(),
+            map_profile=map_profile,
+            task_weight=task_weight,
+            should_force_delivery=should_force,
+        )
+
     plan = GlobalPlan(
         round_num=round_num,
         direct_eta=direct_eta,
@@ -206,6 +258,7 @@ def build_global_plan(
         resource_weight=resource_weight,
         combat_weight=combat_weight,
         reason="+".join(reason_parts),
+        task_sequence=task_sequence,
     )
     logger.info(
         "PLAN global eta=%.1f oppEta=%s scoreGap=%.1f taskGap=%d water=%.2f force=%s reason=%s",
@@ -217,6 +270,19 @@ def build_global_plan(
         plan.should_force_delivery,
         plan.reason,
     )
+    if task_sequence:
+        logger.info(
+            "PLAN task_sequence nodes=%s score=%d cost=%.1f extra=%.1f net=%.1f "
+            "horizon=%.0f next=%s reason=%s",
+            list(task_sequence.task_nodes),
+            task_sequence.total_score,
+            task_sequence.total_cost,
+            task_sequence.extra_delivery_cost,
+            task_sequence.net_value,
+            task_sequence.horizon,
+            task_sequence.next_task_node,
+            task_sequence.reason,
+        )
     return plan
 
 
@@ -450,6 +516,326 @@ def should_set_guard_now(
         weather, None, set(), blocked_nodes,
     )
     return current_node_id not in my_route.path[1:3]
+
+
+def build_task_sequence_plan(
+    round_num: int,
+    player: dict,
+    graph: MapGraph,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    tasks: list[dict],
+    player_id: int,
+    failed_task_ids: set[str],
+    visited_node_ids: set[str],
+    obstacle_nodes: set[str],
+    map_profile: MapProfile | None,
+    task_weight: float,
+    should_force_delivery: bool,
+) -> TaskSequencePlan | None:
+    """Build a rolling 15-20 frame multi-task route plan.
+
+    Each frame re-evaluates the best short sequence (e.g. three 30-point tasks)
+    and exposes only the first task as the immediate target.
+    """
+    current = get_current_node_id(player) or ""
+    if not current:
+        return None
+
+    goal = _delivery_goal_node(player, gate_node_id, terminal_node_ids, graph, current, weather, blocked_nodes, process_nodes)
+    if not goal:
+        return None
+
+    horizon = _planning_horizon(map_profile, should_force_delivery)
+    candidates = _filter_sequence_task_candidates(
+        tasks, player_id, round_num, failed_task_ids, visited_node_ids,
+        obstacle_nodes, player,
+    )
+    if not candidates:
+        return None
+
+    score_gap = max(0, TASK_SCORE_TARGET - get_task_score(player))
+    max_len = min(
+        MAX_SEQUENCE_TASKS,
+        len(candidates),
+        max(1, (score_gap + 29) // 30),
+    )
+
+    best: TaskSequencePlan | None = None
+    for length in range(1, max_len + 1):
+        greedy_seq = _greedy_task_sequence(
+            candidates, length, current, goal, graph, weather,
+            blocked_nodes, process_nodes, round_num, horizon,
+        )
+        best = _pick_better_sequence(
+            best,
+            _wrap_task_sequence(
+                greedy_seq, current, goal, graph, weather, blocked_nodes,
+                process_nodes, round_num, task_weight, should_force_delivery,
+                horizon, "greedy",
+            ),
+        )
+
+    top = sorted(
+        candidates,
+        key=lambda t: (
+            -_task_profile(get_task_template_id(t))[0],
+            _weighted_path_frames(graph, current, t.get("nodeId", ""), weather, blocked_nodes, process_nodes),
+        ),
+    )[:MAX_SEQUENCE_PERMUTE]
+    if len(top) >= 2:
+        for length in range(2, min(max_len + 1, len(top) + 1)):
+            for perm in permutations(top, length):
+                best = _pick_better_sequence(
+                    best,
+                    _wrap_task_sequence(
+                        list(perm), current, goal, graph, weather, blocked_nodes,
+                        process_nodes, round_num, task_weight, should_force_delivery,
+                        horizon, "permute",
+                    ),
+                )
+
+    if best is None or best.net_value < MIN_TASK_NET_VALUE:
+        return None
+    return best
+
+
+def _pick_better_sequence(
+    current: TaskSequencePlan | None,
+    candidate: TaskSequencePlan | None,
+) -> TaskSequencePlan | None:
+    if candidate is None:
+        return current
+    if current is None or candidate.net_value > current.net_value:
+        return candidate
+    return current
+
+
+def _wrap_task_sequence(
+    sequence: list[dict],
+    current: str,
+    goal: str,
+    graph: MapGraph,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    round_num: int,
+    task_weight: float,
+    should_force_delivery: bool,
+    horizon: float,
+    method: str,
+) -> TaskSequencePlan | None:
+    if not sequence:
+        return None
+    metrics = _evaluate_task_sequence_metrics(
+        sequence, current, goal, graph, weather, blocked_nodes,
+        process_nodes, round_num, horizon,
+    )
+    if metrics is None:
+        return None
+    total_cost, total_score, extra_delivery_cost = metrics
+    time_penalty = 0.85 if should_force_delivery else 0.65
+    net_value = (
+        total_score * task_weight
+        - total_cost * time_penalty
+        - extra_delivery_cost * 0.75
+    )
+    first = sequence[0]
+    return TaskSequencePlan(
+        task_ids=tuple(t.get("taskId", "") for t in sequence),
+        task_nodes=tuple(t.get("nodeId", "") for t in sequence),
+        total_score=total_score,
+        total_cost=total_cost,
+        extra_delivery_cost=extra_delivery_cost,
+        net_value=net_value,
+        next_task_id=first.get("taskId", ""),
+        next_task_node=first.get("nodeId", ""),
+        horizon=horizon,
+        reason=f"{method}_len{len(sequence)}",
+    )
+
+
+def _filter_sequence_task_candidates(
+    tasks: list[dict],
+    player_id: int,
+    round_num: int,
+    failed_task_ids: set[str],
+    visited_node_ids: set[str],
+    obstacle_nodes: set[str],
+    player: dict,
+) -> list[dict]:
+    candidates: list[dict] = []
+    for task in tasks:
+        if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
+            continue
+        owner = task.get("ownerPlayerId", 0)
+        if owner not in (0, player_id):
+            continue
+        protection = task.get("protectionPlayerId", 0)
+        if protection not in (0, player_id):
+            continue
+        task_id = task.get("taskId", "")
+        if task_id in failed_task_ids:
+            continue
+        task_node = task.get("nodeId", "")
+        if not task_node:
+            continue
+        if task_node in visited_node_ids:
+            tid = get_task_template_id(task)
+            if not (tid.startswith("T04") and task_node in obstacle_nodes):
+                continue
+        tid = get_task_template_id(task)
+        if tid.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
+            continue
+        expire_round = int(task.get("expireRound", 0) or 0)
+        if expire_round > 0 and round_num >= expire_round:
+            continue
+        candidates.append(task)
+    return candidates
+
+
+def _greedy_task_sequence(
+    candidates: list[dict],
+    length: int,
+    current: str,
+    goal: str,
+    graph: MapGraph,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    round_num: int,
+    horizon: float,
+) -> list[dict]:
+    pool = list(candidates)
+    selected: list[dict] = []
+    cursor = current
+    elapsed = 0.0
+    for _ in range(length):
+        best_task: dict | None = None
+        best_ratio = float("-inf")
+        for task in pool:
+            node = task.get("nodeId", "")
+            travel = _weighted_path_frames(graph, cursor, node, weather, blocked_nodes, process_nodes)
+            if isinf(travel):
+                continue
+            _, process_rounds, _ = _task_profile(get_task_template_id(task))
+            expire_round = int(task.get("expireRound", 0) or 0)
+            projected = round_num + elapsed + travel + process_rounds
+            if expire_round and projected >= expire_round:
+                continue
+            if elapsed + travel + process_rounds > horizon:
+                continue
+            score, _, _ = _task_profile(get_task_template_id(task))
+            ratio = score / max(1.0, travel + process_rounds)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_task = task
+        if best_task is None:
+            break
+        node = best_task.get("nodeId", "")
+        travel = _weighted_path_frames(graph, cursor, node, weather, blocked_nodes, process_nodes)
+        _, process_rounds, _ = _task_profile(get_task_template_id(best_task))
+        elapsed += travel + process_rounds
+        selected.append(best_task)
+        pool.remove(best_task)
+        cursor = node
+    return selected
+
+
+def _evaluate_task_sequence_metrics(
+    sequence: list[dict],
+    current: str,
+    goal: str,
+    graph: MapGraph,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    round_num: int,
+    horizon: float,
+) -> tuple[float, int, float] | None:
+    cursor = current
+    total_cost = 0.0
+    total_score = 0
+    blocked = blocked_nodes or set()
+    for task in sequence:
+        node = task.get("nodeId", "")
+        travel = _weighted_path_frames(graph, cursor, node, weather, blocked, process_nodes)
+        if isinf(travel):
+            return None
+        score, process_rounds, _ = _task_profile(get_task_template_id(task))
+        expire_round = int(task.get("expireRound", 0) or 0)
+        projected = round_num + total_cost + travel + process_rounds
+        if expire_round and projected >= expire_round:
+            return None
+        total_cost += travel + process_rounds
+        total_score += score
+        cursor = node
+    if total_cost > horizon:
+        return None
+    direct = _weighted_path_frames(graph, current, goal, weather, blocked, process_nodes)
+    via_tasks = total_cost + _weighted_path_frames(graph, cursor, goal, weather, blocked, process_nodes)
+    if isinf(direct) or isinf(via_tasks):
+        return None
+    extra_delivery_cost = max(0.0, via_tasks - direct)
+    return total_cost, total_score, extra_delivery_cost
+
+
+def _planning_horizon(map_profile: MapProfile | None, should_force_delivery: bool) -> float:
+    """Adaptive rolling window length (15-20 frames by default)."""
+    horizon = DEFAULT_PLANNING_HORIZON
+    if map_profile:
+        horizon += max(-2.0, min(4.0, (380.0 - map_profile.best_route_cost) / 80.0))
+    if should_force_delivery:
+        horizon *= 0.55
+    return max(12.0, min(22.0, horizon))
+
+
+def _weighted_path_frames(
+    graph: MapGraph,
+    start: str,
+    end: str,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> float:
+    if not start or not end:
+        return float("inf")
+    if start == end:
+        return 0.0
+    blocked = blocked_nodes or set()
+    path = graph.weighted_shortest_path(start, end, weather, blocked, process_nodes)
+    if not path:
+        path = graph.weighted_shortest_path(start, end, weather, None, process_nodes)
+    if not path or len(path) < 2:
+        return float("inf")
+    total = 0.0
+    for a, b in zip(path[:-1], path[1:]):
+        total += graph.edge_cost(a, b, weather, None, process_nodes)
+        if b in blocked:
+            total += OBSTACLE_TRAVERSAL_PENALTY
+    return total
+
+
+def _delivery_goal_node(
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    graph: MapGraph,
+    current: str,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> str:
+    if not is_verified(player) and gate_node_id:
+        return gate_node_id
+    for terminal in terminal_node_ids or []:
+        return terminal
+    if gate_node_id:
+        return gate_node_id
+    return current
 
 
 def _task_profile(template_id: str) -> tuple[int, int, float]:
