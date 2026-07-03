@@ -363,9 +363,10 @@ def _decide_action_impl(
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
                 if move_target:
-                    return _wait_and_weaken_guard(
+                    return _handle_force_delivery_blocker(
                         match_id, round_num, player_id, player,
-                        inquire_nodes, move_target, my_team_id,
+                        move_target, inquire_nodes, tasks, failed_task_ids,
+                        obstacle_nodes, my_team_id,
                     )
 
         if state == "MOVING":
@@ -1495,6 +1496,10 @@ def _handle_tasks(
             task_node = task.get("nodeId", "")
             if not task_node:
                 continue
+            if task_node in visited_node_ids:
+                tid = get_task_template_id(task)
+                if not (tid.startswith("T04") and task_node in obstacle_nodes):
+                    continue
 
             # T06: skip if no horse
             tid = get_task_template_id(task)
