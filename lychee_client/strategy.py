@@ -801,6 +801,9 @@ def _handle_key_choke_forced_pass(
     if current_node_id != "S09" or target_node_id != "S10":
         return None
     if target_node_id in forced_pass_failed_targets:
+        if round_num < 286:
+            logger.info("Round %d: FORCE_DELIVERY holding at S09 for S10 guard window", round_num)
+            return make_action(match_id, round_num, player_id, [make_wait_action()])
         return None
     logger.info("Round %d: FORCE_DELIVERY forced pass probe at key choke %s", round_num, target_node_id)
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
