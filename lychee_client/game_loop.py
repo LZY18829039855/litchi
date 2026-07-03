@@ -43,6 +43,9 @@ class GameClient:
         self.rush_speed_failed = False  # RUSH_SPEED rejected with INVALID_ACTION_TYPE (skip retry)
         self.last_claimed_task_id = ""  # track last CLAIM_TASK taskId for failed_task_ids
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
+        self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
+        self.guard_stuck_target: str = ""
+        self.guard_stuck_rounds: int = 0
         self.last_node_id: str = ""
         self.start_round: int = 1
         self.running = False
@@ -236,11 +239,13 @@ class GameClient:
                 node_id = payload.get("nodeId") or payload.get("targetNodeId", "")
                 if node_id:
                     self.guard_blocked_targets.discard(node_id)
+                    self.avoid_route_nodes.discard(node_id)
                     logger.info("Round %d: Guard broken at %s", inquire.round, node_id)
             if ev_type == "GUARD_WEATHERING":
                 node_id = payload.get("nodeId", "")
                 if node_id and payload.get("defense", 1) <= 0:
                     self.guard_blocked_targets.discard(node_id)
+                    self.avoid_route_nodes.discard(node_id)
             if ev_type in ("PROCESS_COMPLETE", "VERIFY_GATE_COMPLETE"):
                 if payload.get("playerId") == self.player_id:
                     node_id = payload.get("nodeId") or payload.get("targetNodeId")
@@ -259,6 +264,29 @@ class GameClient:
                 if cid and self.active_contest_id == cid:
                     self.active_contest_id = ""
                     logger.info("Round %d: Window contest ended: %s", inquire.round, cid)
+
+        # Track how long we are stuck waiting on a guarded edge
+        player_state = player.get("state", "")
+        next_nid = player.get("nextNodeId", "")
+        if (
+            player_state in ("WAITING", "MOVING")
+            and next_nid
+            and (next_nid in self.guard_blocked_targets or next_nid in self.avoid_route_nodes)
+        ):
+            if next_nid == self.guard_stuck_target:
+                self.guard_stuck_rounds += 1
+            else:
+                self.guard_stuck_target = next_nid
+                self.guard_stuck_rounds = 1
+            if self.guard_stuck_rounds >= 20:
+                self.avoid_route_nodes.add(next_nid)
+                logger.info(
+                    "Round %d: Permanently avoiding %s after %d stuck rounds",
+                    inquire.round, next_nid, self.guard_stuck_rounds,
+                )
+        else:
+            self.guard_stuck_target = ""
+            self.guard_stuck_rounds = 0
 
         # Determine gate and terminal IDs (from start message or inquire nodes)
         gate_node_id = ""
@@ -303,6 +331,7 @@ class GameClient:
             failed_task_ids=self.failed_task_ids,
             rush_speed_failed=self.rush_speed_failed,
             guard_blocked_targets=self.guard_blocked_targets,
+            avoid_route_nodes=self.avoid_route_nodes,
         )
 
         self.send_message(action_msg)

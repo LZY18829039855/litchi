@@ -105,6 +105,7 @@ def decide_action(
     failed_task_ids: set[str] | None = None,
     rush_speed_failed: bool = False,
     guard_blocked_targets: set[str] | None = None,
+    avoid_route_nodes: set[str] | None = None,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -130,6 +131,8 @@ def decide_action(
         failed_task_ids = set()
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
+    if avoid_route_nodes is None:
+        avoid_route_nodes = set()
 
     try:
         return _decide_action_impl(
@@ -138,7 +141,7 @@ def decide_action(
             active_contest_id, last_move_failed, last_move_error,
             gate_node_id, terminal_node_ids, tasks, phase,
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
-            failed_task_ids, rush_speed_failed, guard_blocked_targets,
+            failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -170,9 +173,12 @@ def _decide_action_impl(
     failed_task_ids: set[str] | None = None,
     rush_speed_failed: bool = False,
     guard_blocked_targets: set[str] | None = None,
+    avoid_route_nodes: set[str] | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
+    if avoid_route_nodes is None:
+        avoid_route_nodes = set()
 
     # --- P0: Stability ---
     if is_retired(player) or is_delivered(player):
@@ -198,6 +204,7 @@ def _decide_action_impl(
     blocked = get_blocked_nodes(inquire_nodes, my_team_id, player_id)
     route_blocked = set(blocked)
     route_blocked.update(guard_blocked_targets)
+    route_blocked.update(avoid_route_nodes)
     opp_player = _find_opponent(all_players, player_id)
     mode = classify_opponent_mode(player, opp_player, phase)
 
@@ -207,31 +214,30 @@ def _decide_action_impl(
             obstacle_nodes.add(node.get("nodeId", ""))
 
     if is_in_limited_state(player):
+        guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
+
         if state == "WAITING":
-            # WAITING 仅允许 WAIT / MOVE 到当前目标 / 马 / 疾行令，不能 PROCESS/BREAK_GUARD
             if last_move_failed and last_move_error == "PROCESS_REQUIRED":
                 logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, wait for IDLE", round_num, current_node_id)
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
-            if last_move_failed and last_move_error in (
-                "OBJECT_BUSY", "MOVE_BLOCKED_BY_GUARD", "MOVING_ACTION_FORBIDDEN",
-            ):
-                blocked_target = player.get("nextNodeId", "") or next(
-                    (t for t in guard_blocked_targets if t), ""
-                )
-                squad_msg = _try_squad_weaken_guard(
+            if guard_target:
+                return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
-                    inquire_nodes, blocked_target, my_team_id,
+                    inquire_nodes, guard_target, my_team_id,
                 )
-                if squad_msg:
-                    return squad_msg
+
+            if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
                 logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             next_node = player.get("nextNodeId", "")
             if next_node:
                 if next_node in route_blocked:
-                    return make_action(match_id, round_num, player_id, [make_wait_action()])
+                    return _wait_and_weaken_guard(
+                        match_id, round_num, player_id, player,
+                        inquire_nodes, next_node, my_team_id,
+                    )
                 return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
             if current_node_id:
                 move_target = _find_move_target(
@@ -243,18 +249,18 @@ def _decide_action_impl(
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
                 if move_target:
-                    return make_action(match_id, round_num, player_id, [make_wait_action()])
+                    return _wait_and_weaken_guard(
+                        match_id, round_num, player_id, player,
+                        inquire_nodes, move_target, my_team_id,
+                    )
 
         if state == "MOVING":
-            if last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
-                blocked_target = player.get("nextNodeId", "")
-                squad_msg = _try_squad_weaken_guard(
+            if guard_target or last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
+                target = guard_target or player.get("nextNodeId", "")
+                return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
-                    inquire_nodes, blocked_target, my_team_id,
+                    inquire_nodes, target, my_team_id,
                 )
-                if squad_msg:
-                    return squad_msg
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
             moving_action = _handle_moving(match_id, round_num, player_id, player, graph, weather, phase)
             if moving_action.get("msg_data", {}).get("actions"):
                 return moving_action
@@ -796,7 +802,43 @@ def _choose_window_card(
     return "ABSTAIN"
 
 
-def _try_squad_weaken_guard(
+def _resolve_guard_block_target(
+    player: dict,
+    route_blocked: set[str],
+    guard_blocked_targets: set[str],
+) -> str:
+    """Node blocking our in-progress move (next hop or known guard)."""
+    next_node = player.get("nextNodeId", "")
+    if next_node and next_node in route_blocked:
+        return next_node
+    for t in guard_blocked_targets:
+        if t:
+            return t
+    return ""
+
+
+def _make_squad_weaken_action(
+    inquire_nodes: list[dict],
+    target_node_id: str,
+    my_team_id: str,
+    player_id: int,
+    player: dict,
+) -> dict | None:
+    if not target_node_id or get_squad_count(player) < 2:
+        return None
+    for node in inquire_nodes:
+        if node.get("nodeId") != target_node_id:
+            continue
+        guard = node.get("guard", {})
+        if is_enemy_guard(guard, my_team_id, player_id):
+            if guard.get("defense", 0) > 0:
+                return make_squad_weaken_action(target_node_id)
+            return None
+    # inquire 可能未包含远程节点，仍尝试削弱
+    return make_squad_weaken_action(target_node_id)
+
+
+def _wait_and_weaken_guard(
     match_id: str,
     round_num: int,
     player_id: int,
@@ -804,20 +846,16 @@ def _try_squad_weaken_guard(
     inquire_nodes: list[dict],
     target_node_id: str,
     my_team_id: str,
-) -> dict | None:
-    """Use SQUAD_WEAKEN on a blocked guard node while stuck in MOVING/WAITING."""
-    if not target_node_id or get_squad_count(player) < 2:
-        return None
-    for node in inquire_nodes:
-        if node.get("nodeId") != target_node_id:
-            continue
-        guard = node.get("guard", {})
-        if is_enemy_guard(guard, my_team_id, player_id) and guard.get("defense", 0) > 0:
-            logger.info("Round %d: Squad weaken guard at %s (stuck on route)", round_num, target_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_squad_weaken_action(target_node_id)
-            ])
-    return None
+) -> dict:
+    """WAIT (主车队) + SQUAD_WEAKEN (小分队) 每帧削弱设卡直到通行。"""
+    msg = make_action(match_id, round_num, player_id, [make_wait_action()])
+    squad = _make_squad_weaken_action(
+        inquire_nodes, target_node_id, my_team_id, player_id, player,
+    )
+    if squad:
+        logger.info("Round %d: WAIT + squad weaken at %s", round_num, target_node_id)
+        return _append_squad_action(msg, squad)
+    return msg
 
 
 def _handle_moving(
@@ -1199,8 +1237,12 @@ def _handle_combat(
     if not my_team_id:
         my_team_id = get_team_id(player)
 
-    # SET_GUARD 必须在当前节点（任务书 §6.2.1）
-    if mode in ("AGGRESSIVE", "GATE_FIGHT") and get_good_fruit(player) >= 1:
+    # SET_GUARD 仅在关口争夺或 RUSH 阶段守宫门时（开局设卡浪费帧数）
+    should_set_guard = (
+        mode == "GATE_FIGHT"
+        or (phase == "RUSH" and gate_node_id and current_node_id == gate_node_id)
+    )
+    if should_set_guard and get_good_fruit(player) >= 1:
         guard_target = _find_guard_target(
             graph, current_node_id, gate_node_id, terminal_node_ids,
             weather, blocked, player, inquire_nodes, my_team_id,
@@ -1243,13 +1285,14 @@ def _handle_combat(
     # --- Squad actions (策略文档 §8.4) — only if not RUSH ---
     if phase != "RUSH":
         squad_count = get_squad_count(player)
+        my_task_score = get_task_score(player)
 
-        # SQUAD_SCOUT: Mark remote process points (策略文档 §8.4: 1人手)
-        if squad_count >= 1 and process_nodes:
+        # SQUAD_SCOUT: 仅任务分不足且小分队充裕时偶尔探路
+        if squad_count >= 5 and my_task_score < TASK_SCORE_TARGET and process_nodes:
             for nid, info in process_nodes.items():
                 if nid not in visited_node_ids and nid != current_node_id:
                     dist = graph.path_length(current_node_id, nid, weather, None)
-                    if 0 < dist <= 15:  # INTEL_MAX_DISTANCE
+                    if 0 < dist <= 15:
                         logger.info("Round %d: Squad scout at %s", round_num, nid)
                         return make_action(match_id, round_num, player_id, [
                             make_squad_scout_action(nid)
