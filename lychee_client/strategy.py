@@ -1053,84 +1053,140 @@ def _find_contest(contest_id: str, contests: list[dict] | None) -> dict | None:
     return None
 
 
+# 窗口牌克制表 (任务书 §5.4.4): CARD_BEATS[c] = c 能击败的牌集合。
+# 献贡/兵争各克 2 张、只怕 1 张(强牌); 验牒/强行各克 1 张、怕 2 张(弱牌)。
+CARD_BEATS: dict[str, set[str]] = {
+    "YAN_DIE": {"QIANG_XING"},
+    "QIANG_XING": {"XIAN_GONG"},
+    "XIAN_GONG": {"YAN_DIE", "BING_ZHENG"},
+    "BING_ZHENG": {"YAN_DIE", "QIANG_XING"},
+}
+
+# 各牌的相对成本罚分(资源稀缺度)。价值高的窗口会弱化罚分。
+# 兵争消耗护卫行动点(全局仅4点,最稀缺); 强行会消耗宝贵马匹(应留给加速);
+# 献贡消耗1好果; 验牒消耗文书资源(过所/官凭,本就用于出牌,最廉价)。
+CARD_COST_PENALTY: dict[str, float] = {
+    "YAN_DIE": 1.0,
+    "XIAN_GONG": 1.6,
+    "QIANG_XING": 2.6,
+    "BING_ZHENG": 3.2,
+    "ABSTAIN": 0.0,
+}
+
+_ALL_EFFECTIVE_CARDS = ("YAN_DIE", "QIANG_XING", "XIAN_GONG", "BING_ZHENG")
+
+
+def _window_card_result(mine: str, theirs: str) -> int:
+    """本拍胜负 (任务书 §5.4.4): 胜=1, 平=0, 负=-1。"""
+    if mine == theirs:
+        return 0
+    if theirs == "ABSTAIN":
+        return 1 if mine != "ABSTAIN" else 0
+    if mine == "ABSTAIN":
+        return -1
+    if theirs in CARD_BEATS.get(mine, ()):
+        return 1
+    if mine in CARD_BEATS.get(theirs, ()):
+        return -1
+    return 0
+
+
+def _affordable_window_cards(p: dict | None) -> set[str]:
+    """依据公开状态推断某方本拍买得起哪些有效牌 (任务书 §5.4.3)。"""
+    if not p:
+        return set()
+    cards: set[str] = set()
+    resources = get_player_resources(p)
+    if resources.get("PASS_TOKEN", 0) + resources.get("OFFICIAL_PERMIT", 0) > 0:
+        cards.add("YAN_DIE")
+    if has_resource(p, "FAST_HORSE") or has_resource(p, "SHORT_HORSE"):
+        cards.add("QIANG_XING")
+    if get_good_fruit(p) >= 1 and get_freshness(p) >= 80:
+        cards.add("XIAN_GONG")
+    if get_action_points(p) > 0:
+        cards.add("BING_ZHENG")
+    return cards
+
+
+def _contest_value_profile(
+    contest_type: str, contest: dict | None, on_water_route: bool,
+) -> tuple[bool, float]:
+    """返回 (是否必争, 价值权重 0..1)。价值越高越值得付成本、越可能弃权亏。"""
+    if contest_type == "GATE":
+        return True, 1.0
+    if contest_type == "PASS":
+        return False, 0.8
+    if contest_type in ("TASK", "OBSTACLE"):
+        score = contest.get("taskScore", 0) if contest else 0
+        return (False, 0.6) if score >= 30 else (False, 0.0)
+    if contest_type == "DOCK":
+        return (False, 0.5) if on_water_route else (False, 0.0)
+    if contest_type == "RESOURCE":
+        return False, 0.45
+    return False, 0.0
+
+
 def _choose_window_card(
     contest_type: str, contest: dict | None,
     my_player: dict, all_players: list[dict], phase: str,
     on_water_route: bool = False,
 ) -> str:
-    """Choose window card based on contest type (策略文档 §7.3).
+    """博弈式窗口出牌 (任务书 §5.4)。
 
-    克制关系: 验牒(YAN_DIE) 克 强行(QIANG_XING) 克 献贡(XIAN_GONG) 克 兵争(BING_ZHENG) 克 验牒
+    核心: 对手资源/好果/鲜度/行动点均为公开状态, 由此推断对手本拍能出哪些牌,
+    再用正确克制表做期望胜点最大化, 同时按窗口价值权衡稀缺资源成本。
+    不写死固定优先级, 随对手手牌与窗口价值自适应。
     """
-    resources = get_player_resources(my_player)
-    action_points = get_action_points(my_player)
+    must_win, value = _contest_value_profile(contest_type, contest, on_water_route)
 
-    # Card availability
-    has_yan_die = resources.get("PASS_TOKEN", 0) + resources.get("OFFICIAL_PERMIT", 0) > 0
-    has_bing_zheng = action_points > 0
-    has_xian_gong = get_good_fruit(my_player) >= 1 and get_freshness(my_player) >= 80
-    has_qiang_xing = has_resource(my_player, "FAST_HORSE") or has_resource(my_player, "SHORT_HORSE")
-
-    # Strategy by contest type
-    if contest_type == "GATE":
-        # Must contest gate (策略文档 §7.3: GATE必争)
-        if has_bing_zheng:
-            return "BING_ZHENG"
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_xian_gong:
-            return "XIAN_GONG"
-        return "QIANG_XING"
-
-    if contest_type == "RESOURCE":
-        # Contest for important resources (fast horse, official permit)
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_bing_zheng:
-            return "BING_ZHENG"
-        return "ABSTAIN"  # Not critical enough to spend fruit
-
-    if contest_type == "TASK":
-        # Contest for 30-point tasks (策略文档 §7.3: 30分争, 15分不顺路弃权)
-        if contest and contest.get("taskScore", 0) >= 30:
-            if has_bing_zheng:
-                return "BING_ZHENG"
-            if has_yan_die:
-                return "YAN_DIE"
-            return "ABSTAIN"
-        return "ABSTAIN"  # 15-point tasks not worth contesting
-
-    if contest_type == "DOCK":
-        # Only contest DOCK if on water route (策略文档 §7.3: 走水路必争, 官道路线弃权)
-        if not on_water_route:
-            return "ABSTAIN"
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_bing_zheng:
-            return "BING_ZHENG"
+    my_cards = _affordable_window_cards(my_player)
+    # 低价值且非必争的窗口: 直接弃权, 保留资源。
+    if not must_win and value <= 0.0:
+        return "ABSTAIN"
+    if not my_cards:
         return "ABSTAIN"
 
-    if contest_type == "PASS":
-        # PASS contest: offensive (强行/验牒) vs defensive (策略文档 §7.3)
-        # Attacker wants to pass → qiang_xing or yan_die
-        # Defender → based on cost (abstain if time tax acceptable)
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_qiang_xing:
-            return "QIANG_XING"
-        return "ABSTAIN"
+    opp = _find_opponent(all_players, my_player.get("playerId"))
+    opp_cards = _affordable_window_cards(opp)
 
-    if contest_type == "OBSTACLE":
-        # Only contest for T04 (30 points) at obstacle
-        if contest and contest.get("taskScore", 0) >= 30:
-            if has_bing_zheng:
-                return "BING_ZHENG"
-            if has_yan_die:
-                return "YAN_DIE"
-        return "ABSTAIN"
+    # 估计对手本拍出牌的概率权重。
+    opp_weights: dict[str, float] = {}
+    if opp is None:
+        # 完全观测不到对手对象(信息缺失): 保守假设各有效牌均可能。
+        for c in _ALL_EFFECTIVE_CARDS:
+            opp_weights[c] = 0.5
+        opp_weights["ABSTAIN"] = 1.0
+    elif opp_cards:
+        for c in opp_cards:
+            opp_weights[c] = 1.0
+        # 窗口越重要, 对手越可能认真出牌 → 弃权权重越低。
+        opp_weights["ABSTAIN"] = max(0.1, 1.0 - value)
+    else:
+        # 公开状态显示对手买不起任何有效牌 → 对手本拍只能弃权,
+        # 此时任意有效牌皆胜, 交由成本罚分挑最省的一张。
+        opp_weights["ABSTAIN"] = 1.0
 
-    # Default: abstain
-    return "ABSTAIN"
+    total_w = sum(opp_weights.values()) or 1.0
+
+    def expected(card: str) -> float:
+        return sum(w * _window_card_result(card, o) for o, w in opp_weights.items()) / total_w
+
+    best_card = "ABSTAIN"
+    best_adj = float("-inf") if must_win else 0.0
+    for card in my_cards:
+        exp = expected(card)
+        # 成本罚分随窗口价值弱化, 但始终保留一个下限, 使期望相等时优选省资源的牌。
+        penalty = CARD_COST_PENALTY.get(card, 1.0) * max(0.03, (1.0 - value) * 0.2)
+        adj = exp - penalty
+        if adj > best_adj:
+            best_adj = adj
+            best_card = card
+
+    # 必争窗口(如宫门)绝不弃权: 退化为纯期望最高的有效牌。
+    if must_win and best_card == "ABSTAIN":
+        best_card = max(my_cards, key=expected)
+
+    return best_card
 
 
 def _get_pending_station_process_type(
