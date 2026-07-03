@@ -106,6 +106,7 @@ def decide_action(
     rush_speed_failed: bool = False,
     guard_blocked_targets: set[str] | None = None,
     avoid_route_nodes: set[str] | None = None,
+    pending_task_hold_task_id: str = "",
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
 ) -> dict:
@@ -144,7 +145,7 @@ def decide_action(
             gate_node_id, terminal_node_ids, tasks, phase,
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
-            pending_task_hold_node_id, pending_task_hold_until_round,
+            pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -177,6 +178,7 @@ def _decide_action_impl(
     rush_speed_failed: bool = False,
     guard_blocked_targets: set[str] | None = None,
     avoid_route_nodes: set[str] | None = None,
+    pending_task_hold_task_id: str = "",
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
 ) -> dict:
@@ -249,12 +251,6 @@ def _decide_action_impl(
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if not force_delivery and current_node_id and not next_node:
-                task_retry = _retry_task_at_current_node(
-                    match_id, round_num, player_id, player, graph,
-                    current_node_id, tasks, failed_task_ids,
-                )
-                if task_retry is not None:
-                    return task_retry
                 if (
                     pending_task_hold_node_id == current_node_id
                     and round_num <= pending_task_hold_until_round
@@ -264,6 +260,20 @@ def _decide_action_impl(
                         round_num, current_node_id, pending_task_hold_until_round,
                     )
                     return make_action(match_id, round_num, player_id, [make_wait_action()])
+                if pending_task_hold_node_id == current_node_id and pending_task_hold_task_id:
+                    task_retry = _retry_task_at_current_node(
+                        match_id, round_num, player_id, player, graph,
+                        current_node_id, tasks, failed_task_ids,
+                        preferred_task_id=pending_task_hold_task_id,
+                    )
+                    if task_retry is not None:
+                        return task_retry
+                task_retry = _retry_task_at_current_node(
+                    match_id, round_num, player_id, player, graph,
+                    current_node_id, tasks, failed_task_ids,
+                )
+                if task_retry is not None:
+                    return task_retry
 
             if force_delivery and current_node_id and not next_node:
                 direct_target = _find_direct_delivery_step(
@@ -342,6 +352,18 @@ def _decide_action_impl(
             round_num, current_node_id, pending_task_hold_until_round,
         )
         return make_action(match_id, round_num, player_id, [make_wait_action()])
+    if (
+        not force_delivery
+        and pending_task_hold_node_id == current_node_id
+        and pending_task_hold_task_id
+    ):
+        task_retry = _retry_task_at_current_node(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, tasks, failed_task_ids,
+            preferred_task_id=pending_task_hold_task_id,
+        )
+        if task_retry is not None:
+            return task_retry
 
     # Don't use blocked_nodes as hard filter in BFS — it causes TARGET_NOT_REACHABLE
     # Instead, use weighted routing to prefer unblocked paths
@@ -1159,17 +1181,39 @@ def _retry_task_at_current_node(
     current_node_id: str,
     tasks: list[dict],
     failed_task_ids: set[str],
+    preferred_task_id: str = "",
 ) -> dict | None:
     if get_task_score(player) >= TASK_SCORE_TARGET:
         return None
     if isinstance(player.get("currentProcess"), dict):
         return None
 
-    task = find_task_at_node(
-        tasks, current_node_id, player_id,
-        graph_neighbors=graph.get_neighbors(current_node_id) if graph else None,
-    )
+    neighbors = graph.get_neighbors(current_node_id) if graph else None
+    task = None
+    if preferred_task_id:
+        for candidate in tasks:
+            if candidate.get("taskId", "") == preferred_task_id:
+                task_node = candidate.get("nodeId", "")
+                if (
+                    task_node == current_node_id
+                    or (neighbors is not None and task_node in neighbors and get_task_template_id(candidate).startswith("T04"))
+                ):
+                    task = candidate
+                break
     if not task:
+        task = find_task_at_node(
+            tasks, current_node_id, player_id,
+            graph_neighbors=neighbors,
+        )
+    if not task:
+        return None
+    if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
+        return None
+    owner = task.get("ownerPlayerId", 0)
+    if owner != 0 and owner != player_id:
+        return None
+    protection = task.get("protectionPlayerId", 0)
+    if protection != 0 and protection != player_id:
         return None
 
     task_id = task.get("taskId", "")

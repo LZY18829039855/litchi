@@ -43,6 +43,7 @@ class GameClient:
         self.rush_speed_failed = False  # RUSH_SPEED rejected with INVALID_ACTION_TYPE (skip retry)
         self.last_claimed_task_id = ""  # track last CLAIM_TASK taskId for failed_task_ids
         self.last_claimed_task_node_id = ""
+        self.pending_task_hold_task_id = ""
         self.pending_task_hold_node_id = ""
         self.pending_task_hold_until_round = 0
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
@@ -167,6 +168,7 @@ class GameClient:
             if self.last_node_id and self.last_node_id in self.processed_node_ids:
                 self.processed_node_ids.discard(self.last_node_id)
             if self.pending_task_hold_node_id and self.pending_task_hold_node_id != current_node_id:
+                self.pending_task_hold_task_id = ""
                 self.pending_task_hold_node_id = ""
                 self.pending_task_hold_until_round = 0
             self.last_node_id = current_node_id
@@ -216,10 +218,12 @@ class GameClient:
                         failed_tid = self.last_claimed_task_id
                         if failed_tid:
                             self.failed_task_ids.add(failed_tid)
+                            self.pending_task_hold_task_id = ""
                             self.pending_task_hold_node_id = ""
                             self.pending_task_hold_until_round = 0
                             logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
                     if ar.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
+                        self.pending_task_hold_task_id = self.last_claimed_task_id
                         self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
                         self.pending_task_hold_until_round = inquire.round + 6
                         logger.info(
@@ -259,10 +263,12 @@ class GameClient:
                     failed_tid = self.last_claimed_task_id
                     if failed_tid:
                         self.failed_task_ids.add(failed_tid)
+                        self.pending_task_hold_task_id = ""
                         self.pending_task_hold_node_id = ""
                         self.pending_task_hold_until_round = 0
                         logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
                 if payload.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
+                    self.pending_task_hold_task_id = self.last_claimed_task_id
                     self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
                     self.pending_task_hold_until_round = inquire.round + 6
                     logger.info(
@@ -373,6 +379,7 @@ class GameClient:
             rush_speed_failed=self.rush_speed_failed,
             guard_blocked_targets=self.guard_blocked_targets,
             avoid_route_nodes=self.avoid_route_nodes,
+            pending_task_hold_task_id=self.pending_task_hold_task_id,
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
         )
