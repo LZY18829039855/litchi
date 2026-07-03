@@ -1884,13 +1884,18 @@ def _handle_combat(
                             make_forced_pass_action(next_hop)
                         ])
 
-    # --- Squad actions (策略文档 §8.4) — only if not RUSH ---
+    # --- Squad actions (策略文档 §8.4 / 任务书 §3.4) — only if not RUSH ---
     if phase != "RUSH":
         squad_count = get_squad_count(player)
         my_task_score = get_task_score(player)
 
+        # 任务书 §3.4: 每个 CLEAR/REINFORCE/WEAKEN 消耗 2 人手。SQUAD_WEAKEN 性价比最高，
+        # 因此低优先级的 CLEAR/REINFORCE 需要在动作成本(2)之外为一次未来的 WEAKEN 预留(2)。
+        squad_action_cost = 2
+        squad_low_prio_min = squad_action_cost * 2  # 动作成本 + 为 WEAKEN 预留
+
         # Reserve squads for late key-pass guard weakening; scouting is optional.
-        if squad_count >= 10 and my_task_score < TASK_SCORE_TARGET and process_nodes:
+        if squad_count >= squad_low_prio_min + squad_action_cost and my_task_score < TASK_SCORE_TARGET and process_nodes:
             for nid, info in process_nodes.items():
                 if nid not in visited_node_ids and nid != current_node_id:
                     dist = graph.path_length(current_node_id, nid, weather, None)
@@ -1900,8 +1905,8 @@ def _handle_combat(
                             make_squad_scout_action(nid)
                         ])
 
-        # SQUAD_CLEAR: Clear obstacles without main team (策略文档 §8.4: 2人手)
-        if squad_count >= 8:
+        # SQUAD_CLEAR: Clear obstacles without main team (任务书 §3.4: 2人手)
+        if squad_count >= squad_low_prio_min:
             for node in inquire_nodes:
                 if node.get("hasObstacle", False) and node.get("nodeId") != current_node_id:
                     nid = node.get("nodeId", "")
@@ -1914,8 +1919,8 @@ def _handle_combat(
                                 make_squad_clear_action(nid)
                             ])
 
-        # SQUAD_REINFORCE: Reinforce our own guard at key nodes (策略文档 §8.4: 2人手)
-        if squad_count >= 8:
+        # SQUAD_REINFORCE: Reinforce our own guard at key nodes (任务书 §3.4: 2人手)
+        if squad_count >= squad_low_prio_min:
             for node in inquire_nodes:
                 guard = node.get("guard", {})
                 owner_team = guard.get("ownerTeamId") if guard else ""
@@ -1928,8 +1933,8 @@ def _handle_combat(
                         make_squad_reinforce_action(nid)
                     ])
 
-        # SQUAD_WEAKEN: Weaken enemy guard (策略文档 §8.4: 2人手, 性价比高)
-        if squad_count >= 2 and opp_player:
+        # SQUAD_WEAKEN: Weaken enemy guard (任务书 §3.4: 2人手, 性价比高)
+        if squad_count >= squad_action_cost and opp_player:
             for node in inquire_nodes:
                 guard = node.get("guard", {})
                 if (is_enemy_guard(guard, my_team_id, player_id)
