@@ -33,6 +33,10 @@ MAX_ROUND = 600
 SAFE_DELIVERY_BUFFER = 90
 MIN_TASK_NET_VALUE = 8.0
 MIN_RESOURCE_NET_VALUE = 6.0
+# Average extra frames to clear / forced-pass an obstacle or guard sitting on the
+# route. Obstacles are NOT impassable: treating a choke-point block as unreachable
+# would inflate the delivery ETA to infinity and wrongly trigger force-delivery.
+OBSTACLE_TRAVERSAL_PENALTY = 15.0
 
 RESOURCE_BASE_VALUE = {
     "FAST_HORSE": 28.0,
@@ -140,12 +144,18 @@ def build_global_plan(
     opponent_score_lead = score_gap < -20 or task_gap < -30
     enough_task_score = get_task_score(player) >= 60
 
+    # Adaptive task-gathering deadline: derive from this map's fastest full route
+    # instead of a fixed round number, so short maps keep a long task window while
+    # long maps commit to delivery earlier.
+    route_budget = map_profile.best_route_cost if map_profile else max(direct_eta, 300.0)
+    task_window_deadline = MAX_ROUND - route_budget - safe_buffer * 0.5
+
     should_force = (
         phase == "RUSH"
         or delivery_risk
         or get_task_score(player) >= 90
-        or (enough_task_score and (round_num >= 95 or opponent_time_lead))
-        or round_num >= 175
+        or (enough_task_score and opponent_time_lead)
+        or round_num >= task_window_deadline
     )
     if (
         opponent_score_lead
@@ -306,11 +316,20 @@ def estimate_delivery_route(
     blocked = set(blocked_nodes or set())
 
     for idx, goal in enumerate(goals):
+        # Prefer a route that avoids blocked nodes, but never treat blocks as
+        # impassable: obstacles/guards can be cleared or forced-passed, so a
+        # choke-point block must not inflate the ETA to infinity.
         path = graph.weighted_shortest_path(cursor, goal, weather, blocked, remaining_process)
+        if not path:
+            path = graph.weighted_shortest_path(cursor, goal, weather, None, remaining_process)
         if not path:
             return RouteEstimate(full_path, float("inf"), water_edges, total_edges)
         for a, b in zip(path, path[1:]):
-            total_cost += graph.edge_cost(a, b, weather, blocked, remaining_process)
+            # Cost without the hard block filter (edge_cost returns inf for blocked
+            # targets); model the block as a bounded traversal penalty instead.
+            total_cost += graph.edge_cost(a, b, weather, None, remaining_process)
+            if b in blocked:
+                total_cost += OBSTACLE_TRAVERSAL_PENALTY
             total_edges += 1
             if graph.get_edge_route_type(a, b) == "WATER":
                 water_edges += 1
