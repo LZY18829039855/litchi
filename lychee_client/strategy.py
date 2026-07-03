@@ -218,13 +218,29 @@ def _decide_action_impl(
 
         if state == "WAITING":
             next_node = player.get("nextNodeId", "")
-            if _is_waiting_for_station_process(current_node_id, next_node, process_nodes, processed_node_ids):
-                logger.info("Round %d: station process pending at %s, sending empty action", round_num, current_node_id)
-                return make_empty_action(match_id, round_num, player_id)
+            pending_process_type = _get_pending_station_process_type(
+                current_node_id, next_node, process_nodes, processed_node_ids,
+            )
+            if pending_process_type:
+                if _has_current_process_for_node(player, current_node_id):
+                    logger.info("Round %d: station process running at %s, sending empty action", round_num, current_node_id)
+                    return make_empty_action(match_id, round_num, player_id)
+                logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
+                return _make_process_action(
+                    match_id, round_num, player_id,
+                    pending_process_type, current_node_id, phase,
+                )
 
             if last_move_failed and last_move_error == "PROCESS_REQUIRED":
-                logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, sending empty action", round_num, current_node_id)
-                return make_empty_action(match_id, round_num, player_id)
+                process_type = process_nodes.get(current_node_id, {}).get("processType") if process_nodes and current_node_id else ""
+                if process_type:
+                    logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, retrying %s", round_num, current_node_id, process_type)
+                    return _make_process_action(
+                        match_id, round_num, player_id,
+                        process_type, current_node_id, phase,
+                    )
+                logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, sending WAIT", round_num, current_node_id)
+                return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if guard_target:
                 return _wait_and_weaken_guard(
@@ -806,19 +822,32 @@ def _choose_window_card(
     return "ABSTAIN"
 
 
-def _is_waiting_for_station_process(
+def _get_pending_station_process_type(
     current_node_id: str | None,
     next_node_id: str,
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
-) -> bool:
+) -> str:
     if not current_node_id or next_node_id or not process_nodes:
-        return False
+        return ""
     if current_node_id in processed_node_ids:
-        return False
+        return ""
 
     process_type = process_nodes.get(current_node_id, {}).get("processType")
-    return bool(process_type) and not is_verify_process(process_type)
+    if process_type and not is_verify_process(process_type):
+        return process_type
+    return ""
+
+
+def _has_current_process_for_node(player: dict, current_node_id: str | None) -> bool:
+    if not current_node_id:
+        return False
+    current_process = player.get("currentProcess")
+    if not isinstance(current_process, dict):
+        return False
+    target_node_id = current_process.get("targetNodeId", "")
+    object_key = current_process.get("objectKey", "")
+    return target_node_id == current_node_id or object_key.startswith(f"PROCESS:{current_node_id}:")
 
 
 def _resolve_guard_block_target(
