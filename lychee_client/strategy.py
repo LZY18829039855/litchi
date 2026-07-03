@@ -1090,13 +1090,19 @@ def _wait_and_weaken_guard(
     target_node_id: str,
     my_team_id: str,
 ) -> dict:
-    """WAIT (主车队) + SQUAD_WEAKEN (小分队) 每帧削弱设卡直到通行。"""
-    msg = make_action(match_id, round_num, player_id, [make_wait_action()])
+    """Continue toward the blocked target while squad weakens the guard."""
+    next_node_id = player.get("nextNodeId", "")
+    if next_node_id == target_node_id:
+        msg = make_action(match_id, round_num, player_id, [make_move_action(target_node_id)])
+        main_action = "MOVE"
+    else:
+        msg = make_action(match_id, round_num, player_id, [make_wait_action()])
+        main_action = "WAIT"
     squad = _make_squad_weaken_action(
         inquire_nodes, target_node_id, my_team_id, player_id, player,
     )
     if squad:
-        logger.info("Round %d: WAIT + squad weaken at %s", round_num, target_node_id)
+        logger.info("Round %d: %s + squad weaken at %s", round_num, main_action, target_node_id)
         return _append_squad_action(msg, squad)
     return msg
 
