@@ -719,6 +719,8 @@ def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
     """Stop optional scoring once delivery risk is higher than task/resource value."""
     if phase == "RUSH":
         return True
+    if round_num >= 95 and get_task_score(player) >= 60:
+        return True
     if round_num >= 175:
         return True
     return False
@@ -823,7 +825,7 @@ def _handle_key_choke_forced_pass(
     if current_node_id != "S09" or target_node_id != "S10":
         return None
     if target_node_id in forced_pass_failed_targets:
-        if round_num < 296:
+        if round_num < 292:
             logger.info("Round %d: FORCE_DELIVERY holding at S09 for S10 guard window", round_num)
             return make_action(match_id, round_num, player_id, [make_wait_action()])
         return None
@@ -1573,12 +1575,15 @@ def _handle_use_resources(
 ) -> dict | None:
     """Handle using resources: ice box, horses (策略文档 §6.1)."""
     freshness = get_freshness(player)
+    force_delivery = _should_force_delivery(round_num, phase, player)
 
     # Use ICE_BOX when freshness is low or preemptively before bad weather/routes
     # (策略文档 §6.1: 鲜度<72 或酷暑/山路前)
     if has_resource(player, "ICE_BOX"):
         use_ice = False
-        if freshness < ICE_BOX_FRESHNESS_THRESHOLD:
+        if force_delivery and freshness >= 20:
+            use_ice = False
+        elif freshness < ICE_BOX_FRESHNESS_THRESHOLD:
             use_ice = True
         # Preemptive: check if next route segment is mountain or hot weather
         elif weather and freshness < 80:
@@ -1600,8 +1605,6 @@ def _handle_use_resources(
             return make_action(match_id, round_num, player_id, [
                 make_use_resource_action("ICE_BOX")
             ])
-
-    force_delivery = _should_force_delivery(round_num, phase, player)
 
     # Save horse buffs for forced delivery; using them mid-route wastes the short duration.
     if force_delivery and has_resource(player, "FAST_HORSE"):
