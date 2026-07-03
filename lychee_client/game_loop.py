@@ -10,6 +10,7 @@ from typing import Any
 from lychee_client.transport import encode_frame, read_frames_from_buffer
 from lychee_client.messages import parse_message, StartMessage, InquireMessage, OverMessage
 from lychee_client.map_graph import MapGraph
+from lychee_client.planner import MapProfile, build_map_profile
 from lychee_client.state import can_move, get_current_node_id, needs_processing
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
@@ -29,6 +30,7 @@ class GameClient:
         self.recv_buffer = b""
         self.match_id = ""
         self.graph: MapGraph | None = None
+        self.map_profile: MapProfile | None = None
         self.start_msg: StartMessage | None = None
         self.process_nodes: dict[str, dict] = {}  # nodeId -> {processType, processRound}
         self.active_contest_id: str = ""  # cached contestId from WINDOW_CONTEST_START
@@ -140,6 +142,15 @@ class GameClient:
                     "processRound": pn.get("processRound", 0),
                 }
 
+        self.map_profile = build_map_profile(
+            self.graph,
+            start.start_node_id,
+            start.gate_node_id,
+            start.terminal_node_ids,
+            self.process_nodes,
+            nodes=start.nodes,
+            resources=start.resources,
+        )
         logger.info("Received start: matchId=%s, %d nodes, %d edges, %d process nodes",
                      start.match_id, len(start.nodes), len(start.edges), len(self.process_nodes))
 
@@ -184,6 +195,15 @@ class GameClient:
         if inquire.edges:
             if self.start_msg:
                 self.graph = MapGraph(self.start_msg.nodes, inquire.edges)
+                self.map_profile = build_map_profile(
+                    self.graph,
+                    self.start_msg.start_node_id,
+                    self.start_msg.gate_node_id,
+                    self.start_msg.terminal_node_ids,
+                    self.process_nodes,
+                    nodes=self.start_msg.nodes,
+                    resources=self.start_msg.resources,
+                )
             else:
                 self.graph = MapGraph(inquire.nodes, inquire.edges)
 
@@ -431,6 +451,7 @@ class GameClient:
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
             forced_pass_failed_targets=self.forced_pass_failed_targets,
+            map_profile=self.map_profile,
         )
 
         self.send_message(action_msg)

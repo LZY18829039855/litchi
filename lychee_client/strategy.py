@@ -15,6 +15,17 @@ import logging
 from typing import Any
 
 from lychee_client.map_graph import MapGraph, ROUTE_FRESHNESS_LOSS
+from lychee_client.planner import (
+    GlobalPlan,
+    MapProfile,
+    MIN_RESOURCE_NET_VALUE,
+    MIN_TASK_NET_VALUE,
+    build_global_plan,
+    estimate_delivery_route,
+    resource_net_value,
+    should_set_guard_now,
+    task_net_value,
+)
 from lychee_client.state import (
     can_move, can_act, get_current_node_id, needs_processing,
     is_delivered, is_retired, is_verified, is_at_node, is_in_passive_state,
@@ -110,6 +121,7 @@ def decide_action(
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
+    map_profile: MapProfile | None = None,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -149,7 +161,7 @@ def decide_action(
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
-            forced_pass_failed_targets,
+            forced_pass_failed_targets, map_profile,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -186,6 +198,7 @@ def _decide_action_impl(
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
+    map_profile: MapProfile | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -226,7 +239,12 @@ def _decide_action_impl(
     for node in inquire_nodes:
         if node_has_obstacle(node):
             obstacle_nodes.add(node.get("nodeId", ""))
-    force_delivery = _should_force_delivery(round_num, phase, player)
+    global_plan = build_global_plan(
+        round_num, player, graph, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids, route_blocked,
+        obstacle_nodes, all_players, player_id, phase, map_profile,
+    )
+    force_delivery = _should_force_delivery(round_num, phase, player, global_plan)
 
     if is_in_limited_state(player):
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
@@ -469,6 +487,7 @@ def _decide_action_impl(
             obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
             processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
             failed_task_ids=failed_task_ids,
+            global_plan=global_plan,
         )
         if task_action is not None:
             return task_action
@@ -482,6 +501,13 @@ def _decide_action_impl(
         resource_action = _handle_resources(
             match_id, round_num, player_id, player, graph,
             current_node_id, current_node, phase, weather,
+            global_plan=global_plan,
+            gate_node_id=gate_node_id,
+            terminal_node_ids=terminal_node_ids,
+            process_nodes=process_nodes,
+            processed_node_ids=processed_node_ids,
+            inquire_nodes=inquire_nodes,
+            map_profile=map_profile,
         )
         if resource_action is not None:
             return resource_action
@@ -490,6 +516,8 @@ def _decide_action_impl(
             match_id, round_num, player_id, player, graph,
             current_node_id, current_node, gate_node_id,
             terminal_node_ids, weather, process_nodes, processed_node_ids,
+            global_plan=global_plan,
+            map_profile=map_profile,
         )
         if resource_action is not None:
             return resource_action
@@ -498,6 +526,7 @@ def _decide_action_impl(
     use_res_action = _handle_use_resources(
         match_id, round_num, player_id, player,
         current_node_id, graph, weather, phase,
+        global_plan=global_plan,
     )
     if use_res_action is not None:
         return use_res_action
@@ -512,6 +541,7 @@ def _decide_action_impl(
             process_nodes=process_nodes,
             visited_node_ids=visited_node_ids,
             my_team_id=my_team_id,
+            global_plan=global_plan,
         )
         if combat_action is not None:
             return combat_action
@@ -711,8 +741,15 @@ def _get_goal_node(
     return None
 
 
-def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
+def _should_force_delivery(
+    round_num: int,
+    phase: str,
+    player: dict,
+    global_plan: GlobalPlan | None = None,
+) -> bool:
     """Stop optional scoring once delivery risk is higher than task/resource value."""
+    if global_plan is not None:
+        return global_plan.should_force_delivery
     if phase == "RUSH":
         return True
     if round_num >= 95 and get_task_score(player) >= 60:
@@ -1320,6 +1357,7 @@ def _handle_tasks(
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
     failed_task_ids: set[str] | None = None,
+    global_plan: GlobalPlan | None = None,
 ) -> dict | None:
     """Handle task claiming strategy (策略文档 §5).
 
@@ -1337,7 +1375,7 @@ def _handle_tasks(
         failed_task_ids = set()
 
     my_task_score = get_task_score(player)
-    if _should_force_delivery(round_num, phase, player):
+    if _should_force_delivery(round_num, phase, player, global_plan):
         return None
 
     # Already at stretch target, don't need more tasks
@@ -1380,7 +1418,17 @@ def _handle_tasks(
     if task:
         task_id = task.get("taskId", "")
         if task_id:
-            logger.info("Round %d: Claiming task %s (template=%s) at %s", round_num, task_id, template_id, current_node_id)
+            net_value = task_net_value(task, 0.0, round_num, global_plan, is_current_node=True) if global_plan else 999.0
+            if global_plan and net_value < MIN_TASK_NET_VALUE:
+                logger.info(
+                    "Round %d: Skipping local task %s net=%.1f plan=%s",
+                    round_num, task_id, net_value, global_plan.reason,
+                )
+                return None
+            logger.info(
+                "Round %d: Claiming task %s (template=%s) at %s net=%.1f",
+                round_num, task_id, template_id, current_node_id, net_value,
+            )
             return make_action(match_id, round_num, player_id, [
                 make_claim_task_action(task_id)
             ])
@@ -1424,10 +1472,15 @@ def _handle_tasks(
                     if tid.startswith(prefix):
                         spr = score_per_round
                         break
-                candidates.append((task, detour, spr))
+                net_value = (
+                    task_net_value(task, detour, round_num, global_plan, is_current_node=False)
+                    if global_plan else spr - detour
+                )
+                if net_value >= MIN_TASK_NET_VALUE:
+                    candidates.append((task, detour, net_value))
 
         if candidates:
-            # Sort by: score-per-round descending, then detour ascending
+            # Sort by global net value descending, then detour ascending
             candidates.sort(key=lambda x: (-x[2], x[1]))
             best_task = candidates[0][0]
             task_node = best_task.get("nodeId", "")
@@ -1440,7 +1493,10 @@ def _handle_tasks(
                 # Fallback without soft-blocked
                 step = graph.next_step_toward(current_node_id, task_node, weather, obstacle_nodes, use_weighted=True, process_nodes=process_nodes)
             if step:
-                logger.info("Round %d: Moving toward task at %s (template=%s), step=%s", round_num, task_node, get_task_template_id(best_task), step)
+                logger.info(
+                    "Round %d: Moving toward task at %s (template=%s), step=%s net=%.1f",
+                    round_num, task_node, get_task_template_id(best_task), step, candidates[0][2],
+                )
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
 
     return None
@@ -1471,14 +1527,20 @@ def _calc_detour_cost(
     if direct == float('inf') or via_task == float('inf'):
         return 999
 
-    # Normalize to approximate frame cost (divide by 1000 to get ~frame units)
-    return int((via_task - direct) / 1000)
+    return max(0, int(via_task - direct))
 
 
 def _handle_resources(
     match_id: str, round_num: int, player_id: int,
     player: dict, graph: MapGraph, current_node_id: str,
     current_node: dict | None, phase: str, weather: dict | None,
+    global_plan: GlobalPlan | None = None,
+    gate_node_id: str = "",
+    terminal_node_ids: list[str] | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
+    inquire_nodes: list[dict] | None = None,
+    map_profile: MapProfile | None = None,
 ) -> dict | None:
     """Handle resource claiming strategy (策略文档 §6).
 
@@ -1494,6 +1556,12 @@ def _handle_resources(
         return None
 
     my_resources = get_player_resources(player)
+    route = None
+    if global_plan and gate_node_id:
+        route = estimate_delivery_route(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids or [],
+            weather, process_nodes, processed_node_ids or set(), None,
+        )
 
     # Filter to only high-value resources worth claiming
     HIGH_VALUE_RESOURCES = {"FAST_HORSE", "SHORT_HORSE", "ICE_BOX"}
@@ -1507,27 +1575,83 @@ def _handle_resources(
             continue
         # Only claim high-value resources (FAST_HORSE, SHORT_HORSE, ICE_BOX)
         if rtype in HIGH_VALUE_RESOURCES:
-            logger.info("Round %d: Claiming resource %s at %s", round_num, rtype, current_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_claim_resource_action(current_node_id, rtype)
-            ])
+            value = resource_net_value(rtype, player, global_plan, route, map_profile) if global_plan else 999.0
+            if value >= MIN_RESOURCE_NET_VALUE:
+                logger.info(
+                    "Round %d: Claiming resource %s at %s value=%.1f",
+                    round_num, rtype, current_node_id, value,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_resource_action(current_node_id, rtype)
+                ])
+            continue
         # Claim OFFICIAL_PERMIT/PASS_TOKEN for window contests
         # Keep at least PERMIT_RESERVE+1 (1 for current use + reserve for GATE)
         if rtype in WINDOW_RESOURCES:
             total_permits = my_resources.get("OFFICIAL_PERMIT", 0) + my_resources.get("PASS_TOKEN", 0)
-            if total_permits < PERMIT_RESERVE + 1:
-                logger.info("Round %d: Claiming resource %s at %s (for window contests)", round_num, rtype, current_node_id)
+            value = resource_net_value(rtype, player, global_plan, route, map_profile) if global_plan else 999.0
+            if total_permits < PERMIT_RESERVE + 1 and value >= MIN_RESOURCE_NET_VALUE:
+                logger.info(
+                    "Round %d: Claiming resource %s at %s (for window contests) value=%.1f",
+                    round_num, rtype, current_node_id, value,
+                )
                 return make_action(match_id, round_num, player_id, [
                     make_claim_resource_action(current_node_id, rtype)
                 ])
             continue
         # Claim BOAT_RIGHT (策略文档 §6.1: 仅领取, passive)
         if rtype == "BOAT_RIGHT" and my_resources.get("BOAT_RIGHT", 0) < 1:
-            logger.info("Round %d: Claiming BOAT_RIGHT at %s", round_num, current_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_claim_resource_action(current_node_id, rtype)
-            ])
+            value = resource_net_value(rtype, player, global_plan, route, map_profile) if global_plan else 999.0
+            if value >= MIN_RESOURCE_NET_VALUE:
+                logger.info("Round %d: Claiming BOAT_RIGHT at %s value=%.1f", round_num, current_node_id, value)
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_resource_action(current_node_id, rtype)
+                ])
         # Skip INTEL — low value, not worth the frames early game
+
+    if global_plan and gate_node_id and inquire_nodes:
+        detour_candidates: list[tuple[float, str, str, float]] = []
+        def _route_cost(start: str, end: str) -> float:
+            path = graph.weighted_shortest_path(start, end, weather, None, process_nodes)
+            if not path:
+                return float("inf")
+            return sum(
+                graph.edge_cost(path[i], path[i + 1], weather, None, process_nodes)
+                for i in range(len(path) - 1)
+            )
+
+        for node in inquire_nodes:
+            node_id = node.get("nodeId", "")
+            if not node_id or node_id == current_node_id:
+                continue
+            for rtype, _count in find_available_resources(node):
+                cost_to_resource = _route_cost(current_node_id, node_id)
+                route_after_resource = estimate_delivery_route(
+                    graph, node_id, player, gate_node_id, terminal_node_ids or [],
+                    weather, process_nodes, processed_node_ids or set(), None,
+                )
+                if cost_to_resource == float("inf") or route_after_resource.cost == float("inf"):
+                    continue
+                direct = global_plan.direct_eta
+                detour = max(0.0, cost_to_resource + route_after_resource.cost - direct)
+                if detour > 24:
+                    continue
+                value = resource_net_value(rtype, player, global_plan, route_after_resource, map_profile) - detour * 0.65
+                if value >= MIN_RESOURCE_NET_VALUE:
+                    detour_candidates.append((value, node_id, rtype, detour))
+        if detour_candidates:
+            detour_candidates.sort(key=lambda item: (-item[0], item[3]))
+            value, node_id, rtype, detour = detour_candidates[0]
+            step = graph.next_step_toward(
+                current_node_id, node_id, weather, None,
+                use_weighted=True, process_nodes=process_nodes,
+            )
+            if step:
+                logger.info(
+                    "Round %d: Moving toward resource %s at %s step=%s value=%.1f detour=%.1f",
+                    round_num, rtype, node_id, step, value, detour,
+                )
+                return make_action(match_id, round_num, player_id, [make_move_action(step)])
 
     return None
 
@@ -1545,6 +1669,8 @@ def _handle_force_delivery_resource(
     weather: dict | None,
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
+    global_plan: GlobalPlan | None = None,
+    map_profile: MapProfile | None = None,
 ) -> dict | None:
     """Claim only resources that directly shorten the forced delivery route."""
     if current_node is None or has_resource(player, "FAST_HORSE"):
@@ -1553,11 +1679,26 @@ def _handle_force_delivery_resource(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
     )
-    if current_node_id != "S09" or direct_target != "S10":
+    if not direct_target:
         return None
+    edge = graph.get_edge(current_node_id, direct_target)
+    edge_distance = edge.get("distance", 0) if edge else 0
+    route_type = graph.get_edge_route_type(current_node_id, direct_target)
+    route = estimate_delivery_route(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids, None,
+    )
     for rtype, _count in find_available_resources(current_node):
-        if rtype == "FAST_HORSE":
-            logger.info("Round %d: FORCE_DELIVERY claiming FAST_HORSE at %s", round_num, current_node_id)
+        value = resource_net_value(rtype, player, global_plan, route, map_profile) if global_plan else 999.0
+        if (
+            rtype == "FAST_HORSE"
+            and value >= MIN_RESOURCE_NET_VALUE
+            and (edge_distance >= 30 or route_type in {"ROAD", "MOUNTAIN", "BRANCH"})
+        ):
+            logger.info(
+                "Round %d: FORCE_DELIVERY claiming FAST_HORSE at %s for %s->%s value=%.1f",
+                round_num, current_node_id, current_node_id, direct_target, value,
+            )
             return make_action(match_id, round_num, player_id, [
                 make_claim_resource_action(current_node_id, rtype)
             ])
@@ -1568,10 +1709,11 @@ def _handle_use_resources(
     match_id: str, round_num: int, player_id: int,
     player: dict, current_node_id: str, graph: MapGraph,
     weather: dict | None, phase: str,
+    global_plan: GlobalPlan | None = None,
 ) -> dict | None:
     """Handle using resources: ice box, horses (策略文档 §6.1)."""
     freshness = get_freshness(player)
-    force_delivery = _should_force_delivery(round_num, phase, player)
+    force_delivery = _should_force_delivery(round_num, phase, player, global_plan)
 
     # Use ICE_BOX when freshness is low or preemptively before bad weather/routes
     # (策略文档 §6.1: 鲜度<72 或酷暑/山路前)
@@ -1606,8 +1748,10 @@ def _handle_use_resources(
     if force_delivery and has_resource(player, "FAST_HORSE"):
         neighbors = graph.get_neighbors(current_node_id)
         for n in neighbors:
-            if graph.get_edge_route_type(current_node_id, n) == "ROAD":
-                logger.info("Round %d: Using FAST_HORSE before road move", round_num)
+            edge = graph.get_edge(current_node_id, n)
+            distance = edge.get("distance", 0) if edge else 0
+            if graph.get_edge_route_type(current_node_id, n) in {"ROAD", "MOUNTAIN", "BRANCH"} and distance >= 25:
+                logger.info("Round %d: Using FAST_HORSE before long move %s->%s", round_num, current_node_id, n)
                 return make_action(match_id, round_num, player_id, [
                     make_use_resource_action("FAST_HORSE")
                 ])
@@ -1634,6 +1778,7 @@ def _handle_combat(
     process_nodes: dict[str, dict] | None = None,
     visited_node_ids: set[str] | None = None,
     my_team_id: str = "",
+    global_plan: GlobalPlan | None = None,
 ) -> dict | None:
     """Handle combat: guard, break, squad (策略文档 §8)."""
     if obstacle_nodes is None:
@@ -1646,9 +1791,17 @@ def _handle_combat(
         my_team_id = get_team_id(player)
 
     # SET_GUARD 仅在关口争夺或 RUSH 阶段守宫门时（开局设卡浪费帧数）
+    global_guard = False
+    if global_plan is not None:
+        global_guard = should_set_guard_now(
+            player, opp_player, current_node_id, graph,
+            gate_node_id, terminal_node_ids, weather, blocked,
+            inquire_nodes, global_plan,
+        )
     should_set_guard = (
         mode == "GATE_FIGHT"
         or (phase == "RUSH" and gate_node_id and current_node_id == gate_node_id)
+        or global_guard
     )
     if should_set_guard and get_good_fruit(player) >= 1:
         guard_target = _find_guard_target(
@@ -1656,7 +1809,10 @@ def _handle_combat(
             weather, blocked, player, inquire_nodes, my_team_id,
         )
         if guard_target and guard_target == current_node_id:
-            logger.info("Round %d: Setting guard at current node %s", round_num, guard_target)
+            logger.info(
+                "Round %d: Setting guard at current node %s global=%s",
+                round_num, guard_target, global_guard,
+            )
             extra = 1 if get_good_fruit(player) >= 2 else 0
             return make_action(match_id, round_num, player_id, [
                 make_set_guard_action(guard_target, extra_good_fruit=extra)
