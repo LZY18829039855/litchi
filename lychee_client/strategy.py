@@ -290,15 +290,6 @@ def _decide_action_impl(
                     logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
-            if force_delivery and guard_target:
-                blocker_action = _handle_force_delivery_blocker(
-                    match_id, round_num, player_id, player,
-                    guard_target, inquire_nodes, tasks, failed_task_ids,
-                    obstacle_nodes, my_team_id,
-                )
-                if blocker_action.get("msg_data", {}).get("actions"):
-                    return blocker_action
-
             if guard_target:
                 return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
