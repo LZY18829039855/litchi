@@ -332,6 +332,11 @@ def _decide_action_impl(
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
             if guard_target:
+                if next_node and guard_target == next_node:
+                    return _move_and_weaken_guard(
+                        match_id, round_num, player_id, player,
+                        inquire_nodes, next_node, my_team_id,
+                    )
                 return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, guard_target, my_team_id,
@@ -343,7 +348,7 @@ def _decide_action_impl(
 
             if next_node:
                 if next_node in route_blocked:
-                    return _wait_and_weaken_guard(
+                    return _move_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, next_node, my_team_id,
                     )
@@ -366,7 +371,7 @@ def _decide_action_impl(
         if state == "MOVING":
             if guard_target or last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
                 target = guard_target or player.get("nextNodeId", "")
-                return _wait_and_weaken_guard(
+                return _continue_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, target, my_team_id,
                 )
@@ -1205,6 +1210,48 @@ def _wait_and_weaken_guard(
     if squad:
         logger.info("Round %d: WAIT + squad weaken at %s", round_num, target_node_id)
         return _append_squad_action(msg, squad)
+    return msg
+
+
+def _move_and_weaken_guard(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    inquire_nodes: list[dict],
+    target_node_id: str,
+    my_team_id: str,
+) -> dict:
+    """Resume a paused edge move while optionally weakening the blocking guard."""
+    msg = make_action(match_id, round_num, player_id, [make_move_action(target_node_id)])
+    squad = _make_squad_weaken_action(
+        inquire_nodes, target_node_id, my_team_id, player_id, player,
+    )
+    if squad:
+        logger.info("Round %d: MOVE + squad weaken at %s", round_num, target_node_id)
+        return _append_squad_action(msg, squad)
+    logger.info("Round %d: MOVE to %s while checking route block", round_num, target_node_id)
+    return msg
+
+
+def _continue_and_weaken_guard(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    inquire_nodes: list[dict],
+    target_node_id: str,
+    my_team_id: str,
+) -> dict:
+    """Keep natural movement progress while optionally weakening the guard."""
+    msg = make_empty_action(match_id, round_num, player_id)
+    squad = _make_squad_weaken_action(
+        inquire_nodes, target_node_id, my_team_id, player_id, player,
+    )
+    if squad:
+        logger.info("Round %d: continuing move + squad weaken at %s", round_num, target_node_id)
+        return _append_squad_action(msg, squad)
+    logger.info("Round %d: continuing move while checking route block at %s", round_num, target_node_id)
     return msg
 
 
