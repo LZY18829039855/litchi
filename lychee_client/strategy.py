@@ -466,6 +466,14 @@ def _decide_action_impl(
         )
         if resource_action is not None:
             return resource_action
+    if force_delivery:
+        resource_action = _handle_force_delivery_resource(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, current_node, gate_node_id,
+            terminal_node_ids, weather, process_nodes, processed_node_ids,
+        )
+        if resource_action is not None:
+            return resource_action
 
     # --- P5: Use resources (ice box, horses) ---
     use_res_action = _handle_use_resources(
@@ -1451,6 +1459,38 @@ def _handle_resources(
             ])
         # Skip INTEL — low value, not worth the frames early game
 
+    return None
+
+
+def _handle_force_delivery_resource(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    current_node: dict | None,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+) -> dict | None:
+    """Claim only resources that directly shorten the forced delivery route."""
+    if current_node is None or has_resource(player, "FAST_HORSE"):
+        return None
+    direct_target = _find_direct_delivery_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids,
+    )
+    if current_node_id != "S09" or direct_target != "S10":
+        return None
+    for rtype, _count in find_available_resources(current_node):
+        if rtype == "FAST_HORSE":
+            logger.info("Round %d: FORCE_DELIVERY claiming FAST_HORSE at %s", round_num, current_node_id)
+            return make_action(match_id, round_num, player_id, [
+                make_claim_resource_action(current_node_id, rtype)
+            ])
     return None
 
 
