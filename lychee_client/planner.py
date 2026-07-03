@@ -143,10 +143,16 @@ def build_global_plan(
     should_force = (
         phase == "RUSH"
         or delivery_risk
+        or get_task_score(player) >= 90
         or (enough_task_score and (round_num >= 95 or opponent_time_lead))
         or round_num >= 175
     )
-    if opponent_score_lead and not delivery_risk and phase != "RUSH":
+    if (
+        opponent_score_lead
+        and get_task_score(player) < 90
+        and direct_eta < rounds_left - safe_buffer - 80
+        and phase != "RUSH"
+    ):
         should_force = False
 
     task_weight = 1.0
@@ -357,6 +363,9 @@ def resource_net_value(
     """Score whether a resource should be claimed now."""
     if resource_type in ("FAST_HORSE", "SHORT_HORSE") and has_resource(player, resource_type):
         return -999.0
+    if resource_type == "ICE_BOX" and get_freshness(player) > 65:
+        if not (map_profile and map_profile.mountain_edge_ratio >= 0.25 and plan.direct_eta > 180):
+            return -8.0
     if resource_type == "ICE_BOX" and get_freshness(player) > 75 and plan.direct_eta < 180:
         return -8.0
     favors_water = bool(map_profile and map_profile.favors_water)
@@ -366,6 +375,8 @@ def resource_net_value(
         permits = get_player_resources(player).get("OFFICIAL_PERMIT", 0) + get_player_resources(player).get("PASS_TOKEN", 0)
         if permits >= 2:
             return -5.0
+        if plan.should_force_delivery or plan.combat_weight < 1.25 or plan.direct_eta < 200:
+            return -6.0
     value = RESOURCE_BASE_VALUE.get(resource_type, 3.0)
     if resource_type == "BOAT_RIGHT" and (plan.water_ratio >= 0.34 or favors_water):
         value += 11.0
