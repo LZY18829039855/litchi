@@ -294,6 +294,12 @@ def _decide_action_impl(
                             direct_target, inquire_nodes, tasks, failed_task_ids,
                             obstacle_nodes, my_team_id,
                         )
+                    choke_action = _handle_key_choke_forced_pass(
+                        match_id, round_num, player_id,
+                        current_node_id, direct_target, forced_pass_failed_targets,
+                    )
+                    if choke_action is not None:
+                        return choke_action
                     logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
