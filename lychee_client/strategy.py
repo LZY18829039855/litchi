@@ -243,6 +243,14 @@ def _decide_action_impl(
                 logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, sending WAIT", round_num, current_node_id)
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
+            if not force_delivery and current_node_id and not next_node:
+                task_retry = _retry_task_at_current_node(
+                    match_id, round_num, player_id, player, graph,
+                    current_node_id, tasks, failed_task_ids,
+                )
+                if task_retry is not None:
+                    return task_retry
+
             if force_delivery and current_node_id and not next_node:
                 direct_target = _find_direct_delivery_step(
                     graph, current_node_id, player, gate_node_id, terminal_node_ids,
@@ -1115,6 +1123,42 @@ def _handle_blocked_by_guard(
         ])
 
     return make_empty_action(match_id, round_num, player_id)
+
+
+def _retry_task_at_current_node(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    tasks: list[dict],
+    failed_task_ids: set[str],
+) -> dict | None:
+    if get_task_score(player) >= TASK_SCORE_TARGET:
+        return None
+    if isinstance(player.get("currentProcess"), dict):
+        return None
+
+    task = find_task_at_node(
+        tasks, current_node_id, player_id,
+        graph_neighbors=graph.get_neighbors(current_node_id) if graph else None,
+    )
+    if not task:
+        return None
+
+    task_id = task.get("taskId", "")
+    if not task_id or task_id in failed_task_ids:
+        return None
+    template_id = get_task_template_id(task)
+    if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
+        return None
+    expire_round = task.get("expireRound", 0)
+    if expire_round > 0 and round_num >= expire_round:
+        return None
+
+    logger.info("Round %d: Retrying task %s (template=%s) at %s", round_num, task_id, template_id, current_node_id)
+    return make_action(match_id, round_num, player_id, [make_claim_task_action(task_id)])
 
 
 def _handle_tasks(
