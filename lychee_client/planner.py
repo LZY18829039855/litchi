@@ -97,6 +97,7 @@ class TaskSequencePlan:
     next_task_node: str
     horizon: float
     reason: str
+    route_path: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,152 @@ class GlobalPlan:
     resource_weight: float
     combat_weight: float
     reason: str
+    delivery_route: RouteEstimate
     task_sequence: TaskSequencePlan | None = None
+
+
+def next_step_on_route(route_path: list[str] | tuple[str, ...], current: str) -> str | None:
+    """Return the next hop on a fixed route, or None if off-route / at end."""
+    if not route_path or not current:
+        return None
+    try:
+        idx = route_path.index(current)
+    except ValueError:
+        return None
+    if idx + 1 < len(route_path):
+        return route_path[idx + 1]
+    return None
+
+
+def delivery_goal_node(
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    graph: MapGraph,
+    current: str,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> str:
+    """Ultimate delivery endpoint: gate (unverified) or terminal."""
+    return _delivery_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current, weather, blocked_nodes, process_nodes,
+    )
+
+
+def goal_path_cost(
+    graph: MapGraph,
+    start: str,
+    goal: str,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> float:
+    """Weighted frame cost from start to goal under current world state."""
+    return _weighted_path_frames(graph, start, goal, weather, blocked_nodes, process_nodes)
+
+
+def plan_dynamic_forward_step(
+    graph: MapGraph,
+    current: str,
+    goal: str,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    visited_node_ids: set[str] | None = None,
+    delivery_endpoint: str | None = None,
+) -> str | None:
+    """Replan at the current station; return a hop that never moves away from goal/endpoint.
+
+    The route is recomputed every call (weather, guards, processing). A step is accepted
+    only when it strictly reduces weighted cost toward ``goal`` and, when provided, toward
+    ``delivery_endpoint`` as well.
+    """
+    if not current or not goal or current == goal:
+        return None
+    visited = visited_node_ids or set()
+    routing_blocked = set(blocked_nodes or set())
+    routing_blocked.update(visited)
+    routing_blocked.discard(goal)
+    if delivery_endpoint:
+        routing_blocked.discard(delivery_endpoint)
+
+    path = _find_route_segment(graph, current, goal, weather, routing_blocked, process_nodes)
+    if not path or len(path) < 2:
+        return None
+
+    step = path[1]
+    if step in visited or step == current:
+        return None
+
+    goal_cost_here = goal_path_cost(graph, current, goal, weather, blocked_nodes, process_nodes)
+    goal_cost_step = goal_path_cost(graph, step, goal, weather, blocked_nodes, process_nodes)
+    if not isfinite(goal_cost_here) or not isfinite(goal_cost_step):
+        return None
+    if goal_cost_step >= goal_cost_here - 0.5:
+        return None
+
+    if delivery_endpoint and delivery_endpoint != goal:
+        end_cost_here = goal_path_cost(
+            graph, current, delivery_endpoint, weather, blocked_nodes, process_nodes,
+        )
+        end_cost_step = goal_path_cost(
+            graph, step, delivery_endpoint, weather, blocked_nodes, process_nodes,
+        )
+        if not isfinite(end_cost_here) or not isfinite(end_cost_step):
+            return None
+        if end_cost_step >= end_cost_here - 0.5:
+            return None
+    elif delivery_endpoint:
+        end_cost_here = goal_cost_here
+        end_cost_step = goal_cost_step
+        if end_cost_step >= end_cost_here - 0.5:
+            return None
+
+    return step
+
+
+def replan_forward_step(
+    graph: MapGraph,
+    current: str,
+    goal: str,
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    visited_node_ids: set[str] | None = None,
+    delivery_endpoint: str | None = None,
+) -> str | None:
+    """Recompute forward path; never return a hop that moves away from goal/endpoint."""
+    return plan_dynamic_forward_step(
+        graph, current, goal, weather, blocked_nodes, process_nodes,
+        visited_node_ids, delivery_endpoint,
+    )
+
+
+def build_route_path_through_nodes(
+    graph: MapGraph,
+    start: str,
+    waypoints: list[str],
+    weather: dict | None,
+    blocked_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> tuple[str, ...]:
+    """Concatenate shortest-path segments start → wp1 → wp2 → …"""
+    if not start:
+        return ()
+    path = [start]
+    cursor = start
+    blocked = blocked_nodes or set()
+    for waypoint in waypoints:
+        if not waypoint or waypoint == cursor:
+            continue
+        segment = _find_route_segment(graph, cursor, waypoint, weather, blocked, process_nodes)
+        if not segment:
+            break
+        path.extend(segment[1:])
+        cursor = waypoint
+    return tuple(path)
 
 
 def build_global_plan(
@@ -287,11 +433,13 @@ def build_global_plan(
         resource_weight=resource_weight,
         combat_weight=combat_weight,
         reason="+".join(reason_parts),
+        delivery_route=direct,
         task_sequence=task_sequence,
     )
     logger.info(
-        "PLAN global eta=%.1f oppEta=%s scoreGap=%.1f taskGap=%d water=%.2f force=%s reason=%s",
+        "PLAN global eta=%.1f path=%s oppEta=%s scoreGap=%.1f taskGap=%d water=%.2f force=%s reason=%s",
         plan.direct_eta,
+        "->".join(direct.path) if direct.path else "?",
         "inf" if isinf(plan.opponent_eta) else f"{plan.opponent_eta:.1f}",
         plan.score_gap,
         plan.task_gap,
@@ -301,9 +449,10 @@ def build_global_plan(
     )
     if task_sequence:
         logger.info(
-            "PLAN task_sequence nodes=%s score=%d cost=%.1f extra=%.1f net=%.1f "
+            "PLAN task_sequence nodes=%s path=%s score=%d cost=%.1f extra=%.1f net=%.1f "
             "horizon=%.0f next=%s reason=%s",
             list(task_sequence.task_nodes),
+            "->".join(task_sequence.route_path) if task_sequence.route_path else "?",
             task_sequence.total_score,
             task_sequence.total_cost,
             task_sequence.extra_delivery_cost,
@@ -758,6 +907,10 @@ def _wrap_task_sequence(
         - extra_delivery_cost * 0.75
     )
     first = sequence[0]
+    route_path = build_route_path_through_nodes(
+        graph, current, [t.get("nodeId", "") for t in sequence],
+        weather, blocked_nodes, process_nodes,
+    )
     return TaskSequencePlan(
         task_ids=tuple(t.get("taskId", "") for t in sequence),
         task_nodes=tuple(t.get("nodeId", "") for t in sequence),
@@ -769,6 +922,7 @@ def _wrap_task_sequence(
         next_task_node=first.get("nodeId", ""),
         horizon=horizon,
         reason=f"{method}_len{len(sequence)}",
+        route_path=route_path,
     )
 
 

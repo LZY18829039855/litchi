@@ -22,7 +22,9 @@ from lychee_client.planner import (
     MIN_TASK_NET_VALUE,
     TaskSequencePlan,
     build_global_plan,
+    delivery_goal_node,
     estimate_delivery_route,
+    plan_dynamic_forward_step,
     resource_net_value,
     should_set_guard_now,
     task_net_value,
@@ -318,12 +320,18 @@ def _decide_action_impl(
                     graph, current_node_id, player, gate_node_id, terminal_node_ids,
                     weather, process_nodes, processed_node_ids, route_blocked,
                     visited_node_ids=visited_node_ids,
+                    global_plan=global_plan,
                 )
                 if direct_target:
                     if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        detour = _find_guard_detour_step(
-                            graph, current_node_id,
-                            gate_node_id or (terminal_node_ids[0] if terminal_node_ids else ""),
+                        nav_goal = _navigation_replan_goal(
+                            global_plan, True, player, gate_node_id,
+                            terminal_node_ids, graph, current_node_id, weather,
+                            route_blocked, process_nodes,
+                        )
+                        detour = _dynamic_progress_step(
+                            graph, current_node_id, nav_goal or "",
+                            player, gate_node_id, terminal_node_ids,
                             weather, route_blocked, process_nodes,
                             visited_node_ids=visited_node_ids,
                         )
@@ -354,9 +362,14 @@ def _decide_action_impl(
 
             if next_node:
                 if next_node in route_blocked:
-                    detour = _find_guard_detour_step(
-                        graph, current_node_id,
-                        gate_node_id or (terminal_node_ids[0] if terminal_node_ids else ""),
+                    nav_goal = _navigation_replan_goal(
+                        global_plan, force_delivery, player, gate_node_id,
+                        terminal_node_ids, graph, current_node_id, weather,
+                        route_blocked, process_nodes,
+                    )
+                    detour = _dynamic_progress_step(
+                        graph, current_node_id, nav_goal or "",
+                        player, gate_node_id, terminal_node_ids,
                         weather, route_blocked, process_nodes,
                         visited_node_ids=visited_node_ids,
                     )
@@ -374,13 +387,20 @@ def _decide_action_impl(
                     weather, route_blocked, obstacle_nodes=obstacle_nodes,
                     process_nodes=process_nodes,
                     processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+                    global_plan=global_plan,
+                    force_delivery=force_delivery,
                 )
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
                 if move_target:
-                    detour = _find_guard_detour_step(
-                        graph, current_node_id,
-                        gate_node_id or (terminal_node_ids[0] if terminal_node_ids else ""),
+                    nav_goal = _navigation_replan_goal(
+                        global_plan, force_delivery, player, gate_node_id,
+                        terminal_node_ids, graph, current_node_id, weather,
+                        route_blocked, process_nodes,
+                    )
+                    detour = _dynamic_progress_step(
+                        graph, current_node_id, nav_goal or "",
+                        player, gate_node_id, terminal_node_ids,
                         weather, route_blocked, process_nodes,
                         visited_node_ids=visited_node_ids,
                     )
@@ -478,6 +498,8 @@ def _decide_action_impl(
                 graph, current_node_id, player, gate_node_id, terminal_node_ids,
                 weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
                 processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+                global_plan=global_plan,
+                force_delivery=force_delivery,
             )
             if move_target:
                 return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -506,6 +528,8 @@ def _decide_action_impl(
             current_node_id, gate_node_id, terminal_node_ids,
             weather, blocked_soft, inquire_nodes, process_nodes=process_nodes,
             visited_node_ids=visited_node_ids,
+            global_plan=global_plan,
+            force_delivery=force_delivery,
         )
 
     # --- P2/P3: Task strategy (策略文档 §5) ---
@@ -598,6 +622,7 @@ def _decide_action_impl(
             graph, current_node_id, player, gate_node_id, terminal_node_ids,
             weather, process_nodes, processed_node_ids, route_blocked,
             visited_node_ids=visited_node_ids,
+            global_plan=global_plan,
         )
         if direct_target:
             if direct_target in route_blocked or direct_target in obstacle_nodes:
@@ -616,6 +641,8 @@ def _decide_action_impl(
         weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
         visited_node_ids=visited_node_ids,
+        global_plan=global_plan,
+        force_delivery=force_delivery,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -625,6 +652,8 @@ def _decide_action_impl(
             current_node_id, gate_node_id, terminal_node_ids,
             weather, route_blocked, inquire_nodes, process_nodes=process_nodes,
             visited_node_ids=visited_node_ids,
+            global_plan=global_plan,
+            force_delivery=force_delivery,
         )
         if guard_action.get("msg_data", {}).get("actions"):
             return guard_action
@@ -770,43 +799,128 @@ def _should_force_delivery(
     return False
 
 
-def _find_guard_detour_step(
+def _navigation_replan_goal(
+    global_plan: GlobalPlan | None,
+    force_delivery: bool,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
     graph: MapGraph,
     current_node_id: str,
-    goal: str,
     weather: dict | None,
-    blocked: set[str] | None,
-    process_nodes: dict[str, dict] | None = None,
-    visited_node_ids: set[str] | None = None,
+    route_blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
 ) -> str | None:
-    """Pick an unvisited neighbor that avoids blocked nodes but still progresses toward goal."""
-    if blocked is None:
-        blocked = set()
+    if global_plan:
+        if not force_delivery and global_plan.task_sequence and global_plan.task_sequence.next_task_node:
+            return global_plan.task_sequence.next_task_node
+        if global_plan.delivery_route.path:
+            return global_plan.delivery_route.path[-1]
+    return _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, route_blocked, process_nodes,
+    )
+
+
+def _delivery_endpoint(
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    graph: MapGraph,
+    current_node_id: str,
+    weather: dict | None,
+    route_blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> str | None:
+    endpoint = delivery_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, route_blocked, process_nodes,
+    )
+    return endpoint or None
+
+
+def _resolve_planned_navigation_step(
+    graph: MapGraph,
+    current_node_id: str,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    route_blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str] | None,
+    visited_node_ids: set[str] | None,
+    global_plan: GlobalPlan | None,
+    force_delivery: bool,
+    failed_target: str = "",
+) -> str | None:
+    """Dynamically replan at the current station; never move away from the endpoint."""
+    if not current_node_id:
+        return None
     if visited_node_ids is None:
         visited_node_ids = set()
+    if processed_node_ids is None:
+        processed_node_ids = set()
+
+    segment_goal = _navigation_replan_goal(
+        global_plan, force_delivery, player, gate_node_id, terminal_node_ids,
+        graph, current_node_id, weather, route_blocked, process_nodes,
+    )
+    if not segment_goal:
+        return None
+
+    delivery_endpoint = _delivery_endpoint(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, route_blocked, process_nodes,
+    )
+
+    blocked = set(route_blocked or set())
+    if failed_target:
+        blocked.add(failed_target)
+
+    step = plan_dynamic_forward_step(
+        graph, current_node_id, segment_goal, weather,
+        blocked, process_nodes, visited_node_ids,
+        delivery_endpoint=delivery_endpoint,
+    )
+    if not step:
+        return None
+
     neighbors = graph.get_neighbors(current_node_id)
-    routing_blocked = set(blocked)
-    routing_blocked.update(visited_node_ids)
-    if goal:
-        routing_blocked.discard(goal)
-    best_detour: str | None = None
-    best_cost = float("inf")
-    for neighbor in neighbors:
-        if neighbor in blocked or neighbor in visited_node_ids:
-            continue
-        if not goal:
-            return neighbor
-        path = graph.weighted_shortest_path(neighbor, goal, weather, routing_blocked, process_nodes)
-        if not path:
-            continue
-        cost = sum(
-            graph.edge_cost(path[i], path[i + 1], weather, routing_blocked, process_nodes)
-            for i in range(len(path) - 1)
-        )
-        if cost < best_cost:
-            best_cost = cost
-            best_detour = neighbor
-    return best_detour
+    if step not in neighbors:
+        return None
+
+    logger.info(
+        "_dynamic_step: current=%s step=%s segment_goal=%s endpoint=%s",
+        current_node_id, step, segment_goal, delivery_endpoint,
+    )
+    return step
+
+
+def _dynamic_progress_step(
+    graph: MapGraph,
+    current_node_id: str,
+    segment_goal: str,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    route_blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    visited_node_ids: set[str] | None = None,
+) -> str | None:
+    """Dynamic replan toward segment_goal without moving away from delivery endpoint."""
+    if not segment_goal:
+        return None
+    delivery_endpoint = _delivery_endpoint(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, route_blocked, process_nodes,
+    )
+    return plan_dynamic_forward_step(
+        graph, current_node_id, segment_goal, weather,
+        route_blocked, process_nodes, visited_node_ids,
+        delivery_endpoint=delivery_endpoint,
+    )
 
 
 def _find_direct_delivery_step(
@@ -820,37 +934,12 @@ def _find_direct_delivery_step(
     processed_node_ids: set[str],
     route_blocked: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
+    global_plan: GlobalPlan | None = None,
 ) -> str | None:
-    goal_node = _get_goal_node(
-        player, gate_node_id, terminal_node_ids, graph,
-        current_node_id, weather, None, process_nodes,
-    )
-    if not goal_node:
-        return None
-
-    if visited_node_ids is None:
-        visited_node_ids = set()
-
-    remaining_process_nodes = None
-    if process_nodes:
-        remaining_process_nodes = {
-            nid: info for nid, info in process_nodes.items()
-            if nid not in processed_node_ids
-        }
-
-    blocked = route_blocked or set()
-    soft_blocked = set(blocked)
-    soft_blocked.update(visited_node_ids)
-    soft_blocked.discard(goal_node)
-    step = graph.next_step_toward(
-        current_node_id, goal_node, weather, soft_blocked,
-        use_weighted=True, process_nodes=remaining_process_nodes,
-    )
-    if step and step not in blocked and step not in visited_node_ids:
-        return step
-    return _find_guard_detour_step(
-        graph, current_node_id, goal_node, weather, blocked, remaining_process_nodes,
-        visited_node_ids=visited_node_ids,
+    return _resolve_planned_navigation_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, route_blocked, process_nodes, processed_node_ids,
+        visited_node_ids, global_plan, force_delivery=True,
     )
 
 
@@ -932,81 +1021,29 @@ def _find_move_target(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
+    global_plan: GlobalPlan | None = None,
+    force_delivery: bool = False,
 ) -> str | None:
-    """Find the best move target using weighted shortest path toward the current goal.
-
-    Filters out obstacle nodes (hasObstacle=true) from move targets,
-    since MOVE to an obstacle node will be rejected with TARGET_NOT_REACHABLE.
-    """
+    """Return the next hop on the global planned route toward the current goal."""
     if obstacle_nodes is None:
         obstacle_nodes = set()
-    if processed_node_ids is None:
-        processed_node_ids = set()
     if visited_node_ids is None:
         visited_node_ids = set()
 
-    neighbors = graph.get_neighbors(current_node_id)
-    if not neighbors:
+    step = _resolve_planned_navigation_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, blocked, process_nodes, processed_node_ids,
+        visited_node_ids, global_plan, force_delivery, failed_target,
+    )
+    if not step:
         return None
-
-    # Filter out failed target, obstacle nodes, and enemy-guarded nodes when alternatives exist
-    guard_blocked = blocked or set()
-    available = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
-    if guard_blocked:
-        safe = [n for n in available if n not in guard_blocked]
-        if safe:
-            available = safe
-    forward_available = [n for n in available if n not in visited_node_ids]
-    if forward_available:
-        available = forward_available
-    logger.info("_find_move_target: current=%s neighbors=%s available=%s visited=%s failed_target=%s",
-                current_node_id, neighbors, available, visited_node_ids, failed_target)
-    if not available:
-        logger.info("_find_move_target: no forward neighbor at %s (visited=%s)", current_node_id, visited_node_ids)
+    if step in obstacle_nodes:
+        return step
+    if blocked and step in blocked:
+        return step
+    if step in visited_node_ids:
         return None
-
-    goal_node = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None, process_nodes)
-
-    # Build remaining process nodes (exclude already-processed nodes at current visit)
-    remaining_process_nodes = None
-    if process_nodes:
-        remaining_process_nodes = {
-            nid: info for nid, info in process_nodes.items()
-            if nid not in processed_node_ids
-        }
-
-    if goal_node:
-        # Build soft-blocked set: obstacles + visited + enemy guards
-        soft_blocked = set(obstacle_nodes)
-        soft_blocked.update(visited_node_ids)
-        soft_blocked.update(guard_blocked)
-        # Don't block the goal itself
-        soft_blocked.discard(goal_node)
-
-        # Use weighted Dijkstra first — prefers WATER(1250) over ROAD(1380) over MOUNTAIN(1780)
-        step = graph.next_step_toward(current_node_id, goal_node, weather, soft_blocked, use_weighted=True, process_nodes=remaining_process_nodes)
-        if step and step in available:
-            return step
-        # Fallback: unweighted BFS (still avoids visited via soft_blocked)
-        step = graph.next_step_toward(current_node_id, goal_node, weather, soft_blocked, use_weighted=False)
-        if step and step in available:
-            return step
-        # Pick neighbor with lowest weighted cost to goal
-        best_alt = None
-        best_alt_cost = float('inf')
-        for n in available:
-            path = graph.weighted_shortest_path(n, goal_node, weather, soft_blocked, remaining_process_nodes)
-            if path:
-                cost = sum(graph.edge_cost(path[i], path[i+1], weather, soft_blocked, remaining_process_nodes)
-                           for i in range(len(path)-1))
-                if cost < best_alt_cost:
-                    best_alt_cost = cost
-                    best_alt = n
-        if best_alt:
-            return best_alt
-
-    # No goal: fall back to first available neighbor
-    return available[0]
+    return step
 
 
 def _handle_contesting(
@@ -1350,6 +1387,8 @@ def _handle_blocked_by_guard(
     weather: dict | None, blocked: set[str] | None, inquire_nodes: list[dict],
     process_nodes: dict[str, dict] | None = None,
     visited_node_ids: set[str] | None = None,
+    global_plan: GlobalPlan | None = None,
+    force_delivery: bool = False,
 ) -> dict:
     """Handle MOVE_BLOCKED_BY_GUARD error (策略文档 §3.4)."""
     if blocked is None:
@@ -1357,11 +1396,16 @@ def _handle_blocked_by_guard(
     if visited_node_ids is None:
         visited_node_ids = set()
     neighbors = graph.get_neighbors(current_node_id)
-    goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
+    goal = _navigation_replan_goal(
+        global_plan, force_delivery, player, gate_node_id, terminal_node_ids,
+        graph, current_node_id, weather, blocked, process_nodes,
+    ) or gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
 
-    # Detour via unblocked, unvisited neighbor (e.g. alternate branch when choke guarded)
-    best_detour = _find_guard_detour_step(
-        graph, current_node_id, goal, weather, blocked, process_nodes,
+    # Replan forward around guard; only break guard if no alternate forward path exists
+    best_detour = _dynamic_progress_step(
+        graph, current_node_id, goal,
+        player, gate_node_id, terminal_node_ids,
+        weather, blocked, process_nodes,
         visited_node_ids=visited_node_ids,
     )
     if best_detour:
@@ -1468,6 +1512,9 @@ def _move_toward_planned_task(
     visited_node_ids: set[str] | None,
     failed_task_ids: set[str] | None,
     process_nodes: dict[str, dict] | None,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
 ) -> dict | None:
     """Follow the first step of the rolling multi-task sequence plan."""
     if obstacle_nodes is None:
@@ -1506,18 +1553,11 @@ def _move_toward_planned_task(
     if not task_node or task_node == current_node_id:
         return None
 
-    soft_blocked = set(obstacle_nodes)
-    soft_blocked.update(visited_node_ids)
-    soft_blocked.discard(task_node)
-    step = graph.next_step_toward(
-        current_node_id, task_node, weather, soft_blocked,
-        use_weighted=True, process_nodes=process_nodes,
+    step = _dynamic_progress_step(
+        graph, current_node_id, task_node,
+        player, gate_node_id, terminal_node_ids,
+        weather, blocked, process_nodes, visited_node_ids,
     )
-    if not step:
-        step = graph.next_step_toward(
-            current_node_id, task_node, weather, obstacle_nodes,
-            use_weighted=True, process_nodes=process_nodes,
-        )
     if not step:
         return None
 
@@ -1632,6 +1672,7 @@ def _handle_tasks(
                 match_id, round_num, player_id, graph, current_node_id,
                 tasks, seq, player_id, weather, blocked, obstacle_nodes,
                 visited_node_ids, failed_task_ids, process_nodes,
+                player, goal_node_id, terminal_node_ids,
             )
             if planned_action is not None:
                 return planned_action
@@ -1697,14 +1738,11 @@ def _handle_tasks(
             candidates.sort(key=lambda x: (-x[2], x[1]))
             best_task = candidates[0][0]
             task_node = best_task.get("nodeId", "")
-            # Move toward the task node using weighted routing, avoid backtracking
-            soft_blocked = set(obstacle_nodes)
-            soft_blocked.update(visited_node_ids)
-            soft_blocked.discard(task_node)  # Don't block the target
-            step = graph.next_step_toward(current_node_id, task_node, weather, soft_blocked, use_weighted=True, process_nodes=process_nodes)
-            if not step:
-                # Fallback without soft-blocked
-                step = graph.next_step_toward(current_node_id, task_node, weather, obstacle_nodes, use_weighted=True, process_nodes=process_nodes)
+            step = _dynamic_progress_step(
+                graph, current_node_id, task_node,
+                player, goal_node_id, terminal_node_ids,
+                weather, blocked, process_nodes, visited_node_ids,
+            )
             if step:
                 logger.info(
                     "Round %d: Moving toward task at %s (template=%s), step=%s net=%.1f",
@@ -1857,9 +1895,10 @@ def _handle_resources(
         if detour_candidates:
             detour_candidates.sort(key=lambda item: (-item[0], item[3]))
             value, node_id, rtype, detour = detour_candidates[0]
-            step = graph.next_step_toward(
-                current_node_id, node_id, weather, None,
-                use_weighted=True, process_nodes=process_nodes,
+            step = _dynamic_progress_step(
+                graph, current_node_id, node_id,
+                player, gate_node_id, terminal_node_ids or [],
+                weather, None, process_nodes,
             )
             if step:
                 logger.info(
@@ -1895,6 +1934,7 @@ def _handle_force_delivery_resource(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
         visited_node_ids=visited_node_ids,
+        global_plan=global_plan,
     )
     if not direct_target:
         return None
