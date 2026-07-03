@@ -300,6 +300,12 @@ def _decide_action_impl(
                     )
                     if choke_action is not None:
                         return choke_action
+                    horse_action = _handle_key_choke_horse(
+                        match_id, round_num, player_id, player,
+                        current_node_id, direct_target,
+                    )
+                    if horse_action is not None:
+                        return horse_action
                     logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
@@ -544,6 +550,12 @@ def _decide_action_impl(
             )
             if choke_action is not None:
                 return choke_action
+            horse_action = _handle_key_choke_horse(
+                match_id, round_num, player_id, player,
+                current_node_id, direct_target,
+            )
+            if horse_action is not None:
+                return horse_action
             logger.info("Round %d: FORCE_DELIVERY move to %s (goal=%s)", round_num, direct_target, gate_node_id)
             return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
@@ -807,12 +819,32 @@ def _handle_key_choke_forced_pass(
     if current_node_id != "S09" or target_node_id != "S10":
         return None
     if target_node_id in forced_pass_failed_targets:
-        if round_num < 286:
+        if round_num < 306:
             logger.info("Round %d: FORCE_DELIVERY holding at S09 for S10 guard window", round_num)
             return make_action(match_id, round_num, player_id, [make_wait_action()])
         return None
     logger.info("Round %d: FORCE_DELIVERY forced pass probe at key choke %s", round_num, target_node_id)
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+
+
+def _handle_key_choke_horse(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    current_node_id: str,
+    target_node_id: str,
+) -> dict | None:
+    """Use saved horse before the long S09->S10 crossing."""
+    if current_node_id != "S09" or target_node_id != "S10":
+        return None
+    if has_resource(player, "FAST_HORSE"):
+        logger.info("Round %d: FORCE_DELIVERY using FAST_HORSE for S09->S10", round_num)
+        return make_action(match_id, round_num, player_id, [make_use_resource_action("FAST_HORSE")])
+    if has_resource(player, "SHORT_HORSE"):
+        logger.info("Round %d: FORCE_DELIVERY using SHORT_HORSE for S09->S10", round_num)
+        return make_action(match_id, round_num, player_id, [make_use_resource_action("SHORT_HORSE")])
+    return None
 
 
 def _find_move_target(
