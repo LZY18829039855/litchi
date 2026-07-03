@@ -1,7 +1,10 @@
 # Maven
 target/
 *.jar
-!litchi-client/start.sh
+
+# Python
+__pycache__/
+*.pyc
 
 # IDE
 .idea/
