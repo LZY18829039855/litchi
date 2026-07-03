@@ -311,23 +311,13 @@ def _decide_action_impl(
                 )
                 if direct_target:
                     if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        return _handle_force_delivery_blocker(
+                        # WAITING can only WAIT/MOVE (任务书 §8.2): cannot break the
+                        # guard here. Weaken via squad and retry MOVE; the guard is
+                        # broken decisively once we fall back to IDLE.
+                        return _move_and_weaken_guard(
                             match_id, round_num, player_id, player,
-                            direct_target, inquire_nodes, tasks, failed_task_ids,
-                            obstacle_nodes, my_team_id,
+                            inquire_nodes, direct_target, my_team_id,
                         )
-                    choke_action = _handle_key_choke_forced_pass(
-                        match_id, round_num, player_id,
-                        current_node_id, direct_target, forced_pass_failed_targets,
-                    )
-                    if choke_action is not None:
-                        return choke_action
-                    horse_action = _handle_key_choke_horse(
-                        match_id, round_num, player_id, player,
-                        current_node_id, direct_target,
-                    )
-                    if horse_action is not None:
-                        return horse_action
                     logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
@@ -363,10 +353,10 @@ def _decide_action_impl(
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
                 if move_target:
-                    return _handle_force_delivery_blocker(
+                    # Blocked exit in WAITING: only MOVE/WAIT legal, weaken via squad.
+                    return _move_and_weaken_guard(
                         match_id, round_num, player_id, player,
-                        move_target, inquire_nodes, tasks, failed_task_ids,
-                        obstacle_nodes, my_team_id,
+                        inquire_nodes, move_target, my_team_id,
                     )
 
         if state == "MOVING":
@@ -580,18 +570,6 @@ def _decide_action_impl(
                 )
                 if blocker_action.get("msg_data", {}).get("actions"):
                     return blocker_action
-            choke_action = _handle_key_choke_forced_pass(
-                match_id, round_num, player_id,
-                current_node_id, direct_target, forced_pass_failed_targets,
-            )
-            if choke_action is not None:
-                return choke_action
-            horse_action = _handle_key_choke_horse(
-                match_id, round_num, player_id, player,
-                current_node_id, direct_target,
-            )
-            if horse_action is not None:
-                return horse_action
             logger.info("Round %d: FORCE_DELIVERY move to %s (goal=%s)", round_num, direct_target, gate_node_id)
             return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
@@ -791,28 +769,14 @@ def _handle_force_delivery_blocker(
     obstacle_nodes: set[str],
     my_team_id: str,
 ) -> dict:
-    if target_node_id in obstacle_nodes:
-        t04_task = None
-        for task in tasks:
-            if (task.get("nodeId") == target_node_id
-                    and task.get("active", False)
-                    and not task.get("completed", False)
-                    and not task.get("failed", False)
-                    and get_task_template_id(task).startswith("T04")
-                    and task.get("taskId", "") not in failed_task_ids):
-                t04_task = task
-                break
-        if t04_task:
-            logger.info("Round %d: FORCE_DELIVERY T04 clear at %s", round_num, target_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_claim_task_action(t04_task.get("taskId", ""))
-            ])
-        if get_good_fruit(player) >= 2:
-            logger.info("Round %d: FORCE_DELIVERY CLEAR at %s", round_num, target_node_id)
-            return make_action(match_id, round_num, player_id, [make_clear_action(target_node_id)])
-        logger.info("Round %d: FORCE_DELIVERY forced pass obstacle at %s", round_num, target_node_id)
-        return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+    # NOTE: only called from IDLE-equivalent states. BREAK_GUARD / CLEAR /
+    # FORCED_PASS are illegal while MOVING/WAITING (任务书 §8.2), so callers must
+    # not route WAITING/MOVING here.
 
+    # Priority 1: an enemy guard blocks movement even after the obstacle is
+    # cleared, and CLEAR / T04 do NOT remove a guard. A guard can only be broken
+    # while IDLE, so resolve it first and decisively (repeat BREAK_GUARD until the
+    # defense hits 0), speeding it up with a parallel squad weaken.
     for node in inquire_nodes:
         if node.get("nodeId") != target_node_id:
             continue
@@ -821,54 +785,41 @@ def _handle_force_delivery_blocker(
             good = min(get_good_fruit(player), 2)
             bad = min(get_bad_fruit(player), 2)
             if good + bad > 0:
-                action = make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
-                logger.info("Round %d: FORCE_DELIVERY break guard at %s", round_num, target_node_id)
-                return make_action(match_id, round_num, player_id, [action])
-            logger.info("Round %d: FORCE_DELIVERY forced pass guard at %s", round_num, target_node_id)
+                logger.info(
+                    "Round %d: FORCE_DELIVERY break guard at %s (gf=%d bf=%d)",
+                    round_num, target_node_id, good, bad,
+                )
+                msg = make_action(match_id, round_num, player_id, [
+                    make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
+                ])
+                squad = _make_squad_weaken_action(
+                    inquire_nodes, target_node_id, my_team_id, player_id, player,
+                )
+                return _append_squad_action(msg, squad) if squad else msg
+            logger.info("Round %d: FORCE_DELIVERY forced pass guard at %s (no fruit)", round_num, target_node_id)
             return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+        break
+
+    # Priority 2: a road-only obstacle (no enemy guard). Prefer T04 if it scores,
+    # otherwise FORCED_PASS: it is a deterministic fixed tax (任务书 §6.3.2) and
+    # avoids the CLEAR path that can stall on an OBJECT_BUSY obstacle window.
+    if target_node_id in obstacle_nodes:
+        for task in tasks:
+            if (task.get("nodeId") == target_node_id
+                    and task.get("active", False)
+                    and not task.get("completed", False)
+                    and not task.get("failed", False)
+                    and get_task_template_id(task).startswith("T04")
+                    and task.get("taskId", "") not in failed_task_ids):
+                logger.info("Round %d: FORCE_DELIVERY T04 clear at %s", round_num, target_node_id)
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_task_action(task.get("taskId", ""))
+                ])
+        logger.info("Round %d: FORCE_DELIVERY forced pass obstacle at %s", round_num, target_node_id)
+        return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
     logger.info("Round %d: FORCE_DELIVERY forced pass blocked %s", round_num, target_node_id)
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
-
-
-def _handle_key_choke_forced_pass(
-    match_id: str,
-    round_num: int,
-    player_id: int,
-    current_node_id: str,
-    target_node_id: str,
-    forced_pass_failed_targets: set[str],
-) -> dict | None:
-    """Probe the S10 choke before committing to an edge where only WAIT is legal."""
-    if current_node_id != "S09" or target_node_id != "S10":
-        return None
-    if target_node_id in forced_pass_failed_targets:
-        if round_num < 292:
-            logger.info("Round %d: FORCE_DELIVERY holding at S09 for S10 guard window", round_num)
-            return make_action(match_id, round_num, player_id, [make_wait_action()])
-        return None
-    logger.info("Round %d: FORCE_DELIVERY forced pass probe at key choke %s", round_num, target_node_id)
-    return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
-
-
-def _handle_key_choke_horse(
-    match_id: str,
-    round_num: int,
-    player_id: int,
-    player: dict,
-    current_node_id: str,
-    target_node_id: str,
-) -> dict | None:
-    """Use saved horse before the long S09->S10 crossing."""
-    if current_node_id != "S09" or target_node_id != "S10":
-        return None
-    if has_resource(player, "FAST_HORSE"):
-        logger.info("Round %d: FORCE_DELIVERY using FAST_HORSE for S09->S10", round_num)
-        return make_action(match_id, round_num, player_id, [make_use_resource_action("FAST_HORSE")])
-    if has_resource(player, "SHORT_HORSE"):
-        logger.info("Round %d: FORCE_DELIVERY using SHORT_HORSE for S09->S10", round_num)
-        return make_action(match_id, round_num, player_id, [make_use_resource_action("SHORT_HORSE")])
-    return None
 
 
 def _find_move_target(
