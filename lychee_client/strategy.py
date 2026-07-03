@@ -233,6 +233,10 @@ def _decide_action_impl(
 
         if state == "WAITING":
             next_node = player.get("nextNodeId", "")
+            if last_move_failed and last_move_error == "OBJECT_BUSY":
+                logger.info("Round %d: OBJECT_BUSY in WAITING, sending WAIT", round_num)
+                return make_action(match_id, round_num, player_id, [make_wait_action()])
+
             pending_process_type = _get_pending_station_process_type(
                 current_node_id, next_node, process_nodes, processed_node_ids,
             )
@@ -715,7 +719,7 @@ def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
     """Stop optional scoring once delivery risk is higher than task/resource value."""
     if phase == "RUSH":
         return True
-    if round_num >= 220:
+    if round_num >= 175:
         return True
     return False
 
@@ -819,7 +823,7 @@ def _handle_key_choke_forced_pass(
     if current_node_id != "S09" or target_node_id != "S10":
         return None
     if target_node_id in forced_pass_failed_targets:
-        if round_num < 306:
+        if round_num < 296:
             logger.info("Round %d: FORCE_DELIVERY holding at S09 for S10 guard window", round_num)
             return make_action(match_id, round_num, player_id, [make_wait_action()])
         return None
