@@ -391,7 +391,7 @@ class GameClient:
             else:
                 self.guard_stuck_target = next_nid
                 self.guard_stuck_rounds = 1
-            if self.guard_stuck_rounds >= 20:
+            if self.guard_stuck_rounds >= 20 and next_nid not in self.avoid_route_nodes:
                 self.avoid_route_nodes.add(next_nid)
                 logger.info(
                     "Round %d: Permanently avoiding %s after %d stuck rounds",

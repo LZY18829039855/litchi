@@ -316,13 +316,18 @@ def _decide_action_impl(
             if force_delivery and current_node_id and not next_node:
                 direct_target = _find_direct_delivery_step(
                     graph, current_node_id, player, gate_node_id, terminal_node_ids,
-                    weather, process_nodes, processed_node_ids,
+                    weather, process_nodes, processed_node_ids, route_blocked,
                 )
                 if direct_target:
                     if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        # WAITING can only WAIT/MOVE (任务书 §8.2): cannot break the
-                        # guard here. Weaken via squad and retry MOVE; the guard is
-                        # broken decisively once we fall back to IDLE.
+                        detour = _find_guard_detour_step(
+                            graph, current_node_id,
+                            gate_node_id or (terminal_node_ids[0] if terminal_node_ids else ""),
+                            weather, route_blocked, process_nodes,
+                        )
+                        if detour:
+                            logger.info("Round %d: FORCE_DELIVERY detour to %s (WAITING)", round_num, detour)
+                            return make_action(match_id, round_num, player_id, [make_move_action(detour)])
                         return _move_and_weaken_guard(
                             match_id, round_num, player_id, player,
                             inquire_nodes, direct_target, my_team_id,
@@ -347,6 +352,14 @@ def _decide_action_impl(
 
             if next_node:
                 if next_node in route_blocked:
+                    detour = _find_guard_detour_step(
+                        graph, current_node_id,
+                        gate_node_id or (terminal_node_ids[0] if terminal_node_ids else ""),
+                        weather, route_blocked, process_nodes,
+                    )
+                    if detour:
+                        logger.info("Round %d: Detour to %s instead of blocked %s (WAITING)", round_num, detour, next_node)
+                        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
                     return _move_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, next_node, my_team_id,
@@ -362,7 +375,14 @@ def _decide_action_impl(
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
                 if move_target:
-                    # Blocked exit in WAITING: only MOVE/WAIT legal, weaken via squad.
+                    detour = _find_guard_detour_step(
+                        graph, current_node_id,
+                        gate_node_id or (terminal_node_ids[0] if terminal_node_ids else ""),
+                        weather, route_blocked, process_nodes,
+                    )
+                    if detour:
+                        logger.info("Round %d: Detour to %s instead of blocked %s (WAITING)", round_num, detour, move_target)
+                        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
                     return _move_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, move_target, my_team_id,
@@ -548,6 +568,7 @@ def _decide_action_impl(
             visited_node_ids=visited_node_ids,
             my_team_id=my_team_id,
             global_plan=global_plan,
+            map_profile=map_profile,
         )
         if combat_action is not None:
             return combat_action
@@ -569,7 +590,7 @@ def _decide_action_impl(
     if force_delivery:
         direct_target = _find_direct_delivery_step(
             graph, current_node_id, player, gate_node_id, terminal_node_ids,
-            weather, process_nodes, processed_node_ids,
+            weather, process_nodes, processed_node_ids, route_blocked,
         )
         if direct_target:
             if direct_target in route_blocked or direct_target in obstacle_nodes:
@@ -741,6 +762,38 @@ def _should_force_delivery(
     return False
 
 
+def _find_guard_detour_step(
+    graph: MapGraph,
+    current_node_id: str,
+    goal: str,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None = None,
+) -> str | None:
+    """Pick a neighbor that avoids blocked nodes but still progresses toward goal."""
+    if blocked is None:
+        blocked = set()
+    neighbors = graph.get_neighbors(current_node_id)
+    best_detour: str | None = None
+    best_cost = float("inf")
+    for neighbor in neighbors:
+        if neighbor in blocked:
+            continue
+        if not goal:
+            return neighbor
+        path = graph.weighted_shortest_path(neighbor, goal, weather, blocked, process_nodes)
+        if not path:
+            continue
+        cost = sum(
+            graph.edge_cost(path[i], path[i + 1], weather, blocked, process_nodes)
+            for i in range(len(path) - 1)
+        )
+        if cost < best_cost:
+            best_cost = cost
+            best_detour = neighbor
+    return best_detour
+
+
 def _find_direct_delivery_step(
     graph: MapGraph,
     current_node_id: str,
@@ -750,6 +803,7 @@ def _find_direct_delivery_step(
     weather: dict | None,
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
+    route_blocked: set[str] | None = None,
 ) -> str | None:
     goal_node = _get_goal_node(
         player, gate_node_id, terminal_node_ids, graph,
@@ -765,15 +819,16 @@ def _find_direct_delivery_step(
             if nid not in processed_node_ids
         }
 
-    # Ignore guards/obstacles here. If the direct next hop is blocked, handle
-    # that blocker explicitly instead of oscillating through detours.
+    blocked = route_blocked or set()
     step = graph.next_step_toward(
-        current_node_id, goal_node, weather, None,
+        current_node_id, goal_node, weather, blocked,
         use_weighted=True, process_nodes=remaining_process_nodes,
     )
-    if step:
+    if step and step not in blocked:
         return step
-    return graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
+    return _find_guard_detour_step(
+        graph, current_node_id, goal_node, weather, blocked, remaining_process_nodes,
+    )
 
 
 def _handle_force_delivery_blocker(
@@ -1292,23 +1347,10 @@ def _handle_blocked_by_guard(
     neighbors = graph.get_neighbors(current_node_id)
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
 
-    # Detour via unblocked neighbor (e.g. S09→S05 when S10 guarded)
-    best_detour = None
-    best_cost = float("inf")
-    for n in neighbors:
-        if n in blocked:
-            continue
-        if not goal:
-            return make_action(match_id, round_num, player_id, [make_move_action(n)])
-        path = graph.weighted_shortest_path(n, goal, weather, blocked, process_nodes)
-        if path:
-            cost = sum(
-                graph.edge_cost(path[i], path[i + 1], weather, blocked, process_nodes)
-                for i in range(len(path) - 1)
-            )
-            if cost < best_cost:
-                best_cost = cost
-                best_detour = n
+    # Detour via unblocked neighbor (e.g. S09→S08 when S10 guarded)
+    best_detour = _find_guard_detour_step(
+        graph, current_node_id, goal, weather, blocked, process_nodes,
+    )
     if best_detour:
         logger.info("Round %d: Detour via %s to avoid guard", round_num, best_detour)
         return make_action(match_id, round_num, player_id, [make_move_action(best_detour)])
@@ -1939,6 +1981,7 @@ def _handle_combat(
     visited_node_ids: set[str] | None = None,
     my_team_id: str = "",
     global_plan: GlobalPlan | None = None,
+    map_profile: MapProfile | None = None,
 ) -> dict | None:
     """Handle combat: guard, break, squad (策略文档 §8)."""
     if obstacle_nodes is None:
@@ -1956,7 +1999,7 @@ def _handle_combat(
         global_guard = should_set_guard_now(
             player, opp_player, current_node_id, graph,
             gate_node_id, terminal_node_ids, weather, blocked,
-            inquire_nodes, global_plan,
+            inquire_nodes, global_plan, map_profile,
         )
     should_set_guard = (
         mode == "GATE_FIGHT"

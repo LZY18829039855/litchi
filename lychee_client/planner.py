@@ -138,16 +138,18 @@ def build_global_plan(
     """Build a compact global plan used by the rule-based executor."""
     current = get_current_node_id(player) or ""
     processed = processed_node_ids or set()
-    blocked = set(blocked_nodes or set())
-    blocked.update(obstacle_nodes or set())
+    # Guards/avoid nodes block routing; obstacles are traversable (CLEAR/T04/FORCED_PASS)
+    # and must not inflate the planning ETA used for delivery_risk.
+    guard_blocked = set(blocked_nodes or set())
     direct = estimate_delivery_route(
         graph, current, player, gate_node_id, terminal_node_ids,
-        weather, process_nodes, processed, blocked,
+        weather, process_nodes, processed, guard_blocked,
     )
     direct_eta = _resolve_delivery_eta(
         direct.cost, graph, current, player, gate_node_id, terminal_node_ids,
         process_nodes, processed, map_profile,
     )
+    direct_eta = _normalize_planning_eta(direct_eta, map_profile, round_num, max_round)
 
     opponent = _find_opponent(all_players or [], player_id)
     opponent_eta = float("inf")
@@ -161,6 +163,7 @@ def build_global_plan(
             opp_route.cost, graph, get_current_node_id(opponent) or "", opponent,
             gate_node_id, terminal_node_ids, process_nodes, set(), map_profile,
         )
+        opponent_eta = _normalize_planning_eta(opponent_eta, map_profile, round_num, max_round)
 
     my_score = float(player.get("totalScore", 0) or 0)
     opp_score = float(opponent.get("totalScore", 0) or 0) if opponent else my_score
@@ -178,7 +181,10 @@ def build_global_plan(
     )
     task_window_deadline = max_round - route_budget - safe_buffer * 0.5
 
-    delivery_risk = isfinite(direct_eta) and direct_eta >= rounds_left - safe_buffer
+    delivery_risk = (
+        isfinite(direct_eta)
+        and round_num + direct_eta >= max_round - safe_buffer
+    )
     opponent_time_lead = (
         isfinite(direct_eta)
         and isfinite(opponent_eta)
@@ -202,14 +208,14 @@ def build_global_plan(
         and get_task_score(player) < TASK_SCORE_TARGET
         and round_num < task_window_deadline
         and isfinite(direct_eta)
-        and direct_eta < rounds_left - safe_buffer
+        and round_num + direct_eta < max_round - safe_buffer
     ):
         should_force = False
     elif (
         opponent_score_lead
         and get_task_score(player) < 90
         and isfinite(direct_eta)
-        and direct_eta < rounds_left - safe_buffer - 80
+        and round_num + direct_eta < max_round - safe_buffer - 80
         and phase != "RUSH"
     ):
         should_force = False
@@ -257,7 +263,7 @@ def build_global_plan(
             gate_node_id=gate_node_id,
             terminal_node_ids=terminal_node_ids,
             weather=weather,
-            blocked_nodes=blocked,
+            blocked_nodes=guard_blocked,
             process_nodes=process_nodes,
             tasks=tasks,
             player_id=player_id,
@@ -502,6 +508,21 @@ def _resolve_delivery_eta(
     return float("inf")
 
 
+def _normalize_planning_eta(
+    eta: float,
+    map_profile: MapProfile | None,
+    round_num: int,
+    max_round: int,
+) -> float:
+    """Clamp inflated weather/process ETA so it does not trigger premature force delivery."""
+    if not isfinite(eta) or not map_profile:
+        return eta
+    rounds_left = max_round - round_num
+    slack = max(20.0, rounds_left * 0.05)
+    ceiling = map_profile.best_route_cost + slack
+    return min(eta, ceiling)
+
+
 def task_net_value(
     task: dict,
     detour_cost: float,
@@ -581,6 +602,7 @@ def should_set_guard_now(
     blocked_nodes: set[str] | None,
     inquire_nodes: list[dict],
     plan: GlobalPlan,
+    map_profile: MapProfile | None = None,
 ) -> bool:
     """Decide whether setting a guard is globally worthwhile."""
     if not opponent or not current_node_id or get_good_fruit(player) < 1:
@@ -588,6 +610,8 @@ def should_set_guard_now(
     if plan.combat_weight < 0.9:
         return False
     if plan.should_force_delivery and plan.direct_eta < plan.opponent_eta + 25:
+        return False
+    if get_task_score(player) < TASK_SCORE_TARGET:
         return False
     my_team_id = get_team_id(player)
     for node in inquire_nodes:
@@ -603,11 +627,9 @@ def should_set_guard_now(
     )
     if current_node_id not in opp_route.path:
         return False
-    my_route = estimate_delivery_route(
-        graph, current_node_id, player, gate_node_id, terminal_node_ids,
-        weather, None, set(), blocked_nodes,
-    )
-    return current_node_id not in my_route.path[1:3]
+    if map_profile and current_node_id not in map_profile.choke_nodes:
+        return False
+    return True
 
 
 def build_task_sequence_plan(
