@@ -681,27 +681,6 @@ def _is_on_water_route(
     return False
 
 
-def _get_weather_penalized_routes(weather: dict) -> set[str]:
-    """Get route types that should be penalized/avoided based on weather forecast.
-
-    Returns set of route types to avoid (策略文档 §3.2, §6).
-    """
-    avoid = set()
-    if not weather:
-        return avoid
-    forecasts = weather.get("forecast", []) + weather.get("active", [])
-    for fw in forecasts:
-        wtype = fw.get("type", "")
-        region = fw.get("region", "")
-        if wtype == "HOT" or region == "ALL":
-            avoid.add("MOUNTAIN")
-        elif wtype == "HEAVY_RAIN" or region == "WATER":
-            avoid.add("WATER")
-        elif wtype == "MOUNTAIN_FOG" or region == "MOUNTAIN":
-            avoid.add("MOUNTAIN")
-    return avoid
-
-
 def _get_process_type(
     current_node: dict | None,
     process_nodes: dict[str, dict] | None,

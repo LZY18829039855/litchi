@@ -61,6 +61,11 @@ class MapGraph:
         self.adjacency: dict[str, list[str]] = {}  # nodeId -> [neighbor nodeIds]
         self.edge_info: dict[tuple[str, str], dict] = {}  # (from, to) -> edge data
         self.node_info: dict[str, dict] = {}  # nodeId -> node data
+        # Current settlement frame, set per-inquire by the game loop. When present,
+        # weighted pathfinding becomes weather-forecast aware: a forecast penalty is
+        # only applied to an edge if its predicted traversal window overlaps the
+        # weather's active window (see edge_cost / weighted_shortest_path).
+        self.current_round: int | None = None
 
         for node in nodes:
             nid = node.get("nodeId", "")
@@ -128,11 +133,17 @@ class MapGraph:
         weather: dict | None = None,
         blocked_nodes: set[str] | None = None,
         process_nodes: dict[str, dict] | None = None,
+        arrival_round: float | None = None,
     ) -> float:
         """Calculate edge traversal cost for weighted pathfinding.
 
         Cost = distance * routeType_factor, plus weather and process penalties.
         Returns infinity if the target node is blocked.
+
+        arrival_round: absolute frame at which the mover would START crossing this
+        edge. When provided, weather penalties are applied only if the predicted
+        crossing window overlaps the weather's active window (forecast-aware
+        rerouting). When None, all active+forecast weather is applied (legacy).
         """
         if blocked_nodes and to_id in blocked_nodes:
             return float('inf')
@@ -147,24 +158,9 @@ class MapGraph:
         # Cost in frame units: distance * routeCostFactor / 1000
         base_cost = distance * base_factor / 1000
 
-        # Apply weather penalty (协议: region=ALL/WATER/MOUNTAIN + type=HOT/HEAVY_RAIN/MOUNTAIN_FOG)
+        # Apply weather penalty (协议 附录D: active[]/forecast[] + region=ALL/WATER/MOUNTAIN)
         if weather:
-            weather_events = list(weather.get("active", [])) + list(weather.get("forecast", []))
-            for fw in weather_events:
-                weather_type = fw.get("type", "")
-                region = fw.get("region", "")
-                route_penalties = WEATHER_ROUTE_PENALTY.get(weather_type, {})
-                if not route_penalties:
-                    continue
-                if region == "ALL" or region == weather_type:
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
-                elif region == "WATER" and route_type == "WATER":
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
-                elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
+            base_cost *= self._weather_multiplier(route_type, weather, arrival_round, base_cost)
 
         # Add process cost penalty for the target node
         if process_nodes and to_id in process_nodes:
@@ -173,6 +169,45 @@ class MapGraph:
                 base_cost += PROCESS_COST_PENALTY[pt]
 
         return base_cost
+
+    def _weather_multiplier(
+        self, route_type: str, weather: dict,
+        arrival_round: float | None, cross_frames: float,
+    ) -> float:
+        """Combined weather cost multiplier for crossing a route_type edge.
+
+        If arrival_round is given, only weather whose active window overlaps the
+        predicted crossing window [arrival_round, arrival_round + cross_frames]
+        is counted, so a forecast that won't be in effect when we pass (or has
+        already ended) does not distort routing.
+        """
+        multiplier = 1.0
+        cur = self.current_round if self.current_round is not None else 0
+        cross_end = (arrival_round + max(cross_frames, 1.0)) if arrival_round is not None else None
+
+        def overlaps(win_start: float, win_end: float) -> bool:
+            if arrival_round is None:
+                return True  # legacy: no timing info → always apply
+            return arrival_round <= win_end and cross_end >= win_start
+
+        for fw in weather.get("active", []) or []:
+            penalties = WEATHER_ROUTE_PENALTY.get(fw.get("type", ""), {})
+            factor = penalties.get(route_type)
+            if not factor:
+                continue
+            if overlaps(cur, cur + fw.get("remainRound", 0)):
+                multiplier *= factor
+
+        for fw in weather.get("forecast", []) or []:
+            penalties = WEATHER_ROUTE_PENALTY.get(fw.get("type", ""), {})
+            factor = penalties.get(route_type)
+            if not factor:
+                continue
+            start = fw.get("startRound", 0)
+            if overlaps(start, start + fw.get("durationRound", 0)):
+                multiplier *= factor
+
+        return multiplier
 
     def shortest_path(
         self, from_id: str, to_id: str,
@@ -245,7 +280,10 @@ class MapGraph:
             for neighbor in self.adjacency.get(node, []):
                 if neighbor in visited:
                     continue
-                cost = self.edge_cost(node, neighbor, weather, blocked_nodes, process_nodes)
+                # d ≈ frames elapsed from the query origin to `node`, so the mover
+                # would start crossing this edge around current_round + d.
+                arrival = (self.current_round + d) if self.current_round is not None else None
+                cost = self.edge_cost(node, neighbor, weather, blocked_nodes, process_nodes, arrival_round=arrival)
                 new_dist = d + cost
                 if new_dist < dist.get(neighbor, float('inf')):
                     dist[neighbor] = new_dist

@@ -207,6 +207,11 @@ class GameClient:
             else:
                 self.graph = MapGraph(inquire.nodes, inquire.edges)
 
+        # Tell the graph the current frame so weighted pathfinding can apply
+        # weather forecasts only when they overlap our predicted crossing window.
+        if self.graph is not None:
+            self.graph.current_round = inquire.round
+
         # Update process_nodes from inquire.nodes[] (runtime state may override)
         for node in inquire.nodes:
             nid = node.get("nodeId", "")
