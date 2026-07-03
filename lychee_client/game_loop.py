@@ -192,6 +192,22 @@ class GameClient:
                     "processType": pt,
                     "processRound": node.get("processRound", 0),
                 }
+            if nid and (nid in self.guard_blocked_targets or nid in self.avoid_route_nodes):
+                guard = node.get("guard", {}) or {}
+                owner_team = guard.get("ownerTeamId") or guard.get("teamId", "")
+                owner_player = guard.get("playerId")
+                is_enemy_active = (
+                    guard.get("active", True) is not False
+                    and guard.get("defense", 0) > 0
+                    and (
+                        (owner_team and owner_team != player.get("teamId", ""))
+                        or (owner_player is not None and owner_player != self.player_id)
+                    )
+                )
+                if not is_enemy_active:
+                    self.guard_blocked_targets.discard(nid)
+                    self.avoid_route_nodes.discard(nid)
+                    logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
 
         # Check last action result
         last_failed = False
