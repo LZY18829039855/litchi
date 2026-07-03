@@ -193,19 +193,10 @@ class GameClient:
             self.last_node_id = current_node_id
             self.visited_node_ids.add(current_node_id)
 
-        # Update graph if edges are provided
+        # Update graph if edges are provided (map profile is static — build once at start)
         if inquire.edges:
             if self.start_msg:
                 self.graph = MapGraph(self.start_msg.nodes, inquire.edges)
-                self.map_profile = build_map_profile(
-                    self.graph,
-                    self.start_msg.start_node_id,
-                    self.start_msg.gate_node_id,
-                    self.start_msg.terminal_node_ids,
-                    self.process_nodes,
-                    nodes=self.start_msg.nodes,
-                    resources=self.start_msg.resources,
-                )
             else:
                 self.graph = MapGraph(inquire.nodes, inquire.edges)
 

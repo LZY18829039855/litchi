@@ -619,6 +619,12 @@ def _decide_action_impl(
                 make_claim_task_action(t04_task.get("taskId", ""))
             ])
 
+        if force_delivery:
+            logger.info("Round %d: Obstacle at %s, FORCE FORCED_PASS", round_num, move_target)
+            return make_action(match_id, round_num, player_id, [
+                make_forced_pass_action(move_target)
+            ])
+
         # Priority 2: CLEAR if we have good fruit to spare (策略文档 §3.4: 1好果6帧)
         good_fruit = get_good_fruit(player)
         if good_fruit >= 2:  # Reserve at least 1 for DELIVER

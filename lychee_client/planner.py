@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from itertools import permutations
-from math import isinf
+from math import isinf, isfinite
 
 from lychee_client.map_graph import MapGraph, PROCESS_COST_FRAMES
 from lychee_client.state import (
@@ -144,16 +144,23 @@ def build_global_plan(
         graph, current, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed, blocked,
     )
-    direct_eta = direct.cost
+    direct_eta = _resolve_delivery_eta(
+        direct.cost, graph, current, player, gate_node_id, terminal_node_ids,
+        process_nodes, processed, map_profile,
+    )
 
     opponent = _find_opponent(all_players or [], player_id)
     opponent_eta = float("inf")
     if opponent:
-        opponent_eta = estimate_delivery_route(
+        opp_route = estimate_delivery_route(
             graph, get_current_node_id(opponent) or "", opponent,
             gate_node_id, terminal_node_ids, weather, process_nodes,
             set(), set(),
-        ).cost
+        )
+        opponent_eta = _resolve_delivery_eta(
+            opp_route.cost, graph, get_current_node_id(opponent) or "", opponent,
+            gate_node_id, terminal_node_ids, process_nodes, set(), map_profile,
+        )
 
     my_score = float(player.get("totalScore", 0) or 0)
     opp_score = float(opponent.get("totalScore", 0) or 0) if opponent else my_score
@@ -165,16 +172,20 @@ def build_global_plan(
         safe_buffer -= 12
     if map_profile and map_profile.best_route_cost > 430:
         safe_buffer += 18
-    delivery_risk = direct_eta >= rounds_left - safe_buffer
-    opponent_time_lead = opponent_eta + 20 < direct_eta
+
+    route_budget = map_profile.best_route_cost if map_profile else (
+        direct_eta if isfinite(direct_eta) else 300.0
+    )
+    task_window_deadline = max_round - route_budget - safe_buffer * 0.5
+
+    delivery_risk = isfinite(direct_eta) and direct_eta >= rounds_left - safe_buffer
+    opponent_time_lead = (
+        isfinite(direct_eta)
+        and isfinite(opponent_eta)
+        and opponent_eta + 20 < direct_eta
+    )
     opponent_score_lead = score_gap < -20 or task_gap < -30
     enough_task_score = get_task_score(player) >= 60
-
-    # Adaptive task-gathering deadline: derive from this map's fastest full route
-    # instead of a fixed round number, so short maps keep a long task window while
-    # long maps commit to delivery earlier.
-    route_budget = map_profile.best_route_cost if map_profile else max(direct_eta, 300.0)
-    task_window_deadline = max_round - route_budget - safe_buffer * 0.5
 
     should_force = (
         phase == "RUSH"
@@ -183,9 +194,21 @@ def build_global_plan(
         or (enough_task_score and opponent_time_lead)
         or round_num >= task_window_deadline
     )
+    # Still inside the adaptive task window with safe delivery slack — keep scoring.
     if (
+        should_force
+        and not delivery_risk
+        and phase != "RUSH"
+        and get_task_score(player) < TASK_SCORE_TARGET
+        and round_num < task_window_deadline
+        and isfinite(direct_eta)
+        and direct_eta < rounds_left - safe_buffer
+    ):
+        should_force = False
+    elif (
         opponent_score_lead
         and get_task_score(player) < 90
+        and isfinite(direct_eta)
         and direct_eta < rounds_left - safe_buffer - 80
         and phase != "RUSH"
     ):
@@ -385,17 +408,16 @@ def estimate_delivery_route(
         # Prefer a route that avoids blocked nodes, but never treat blocks as
         # impassable: obstacles/guards can be cleared or forced-passed, so a
         # choke-point block must not inflate the ETA to infinity.
-        path = graph.weighted_shortest_path(cursor, goal, weather, blocked, remaining_process)
-        if not path:
-            path = graph.weighted_shortest_path(cursor, goal, weather, None, remaining_process)
+        path = _find_route_segment(graph, cursor, goal, weather, blocked, remaining_process)
         if not path:
             return RouteEstimate(full_path, float("inf"), water_edges, total_edges)
+        segment_cost = _path_frames_cost(
+            graph, path, weather, blocked, remaining_process,
+        )
+        if isinf(segment_cost):
+            return RouteEstimate(full_path, float("inf"), water_edges, total_edges)
+        total_cost += segment_cost
         for a, b in zip(path, path[1:]):
-            # Cost without the hard block filter (edge_cost returns inf for blocked
-            # targets); model the block as a bounded traversal penalty instead.
-            total_cost += graph.edge_cost(a, b, weather, None, remaining_process)
-            if b in blocked:
-                total_cost += OBSTACLE_TRAVERSAL_PENALTY
             total_edges += 1
             if graph.get_edge_route_type(a, b) == "WATER":
                 water_edges += 1
@@ -408,6 +430,76 @@ def estimate_delivery_route(
             total_cost += verify_cost
 
     return RouteEstimate(full_path, total_cost, water_edges, total_edges)
+
+
+def _find_route_segment(
+    graph: MapGraph,
+    start: str,
+    goal: str,
+    weather: dict | None,
+    blocked: set[str],
+    process_nodes: dict[str, dict] | None,
+) -> list[str]:
+    """Find a route segment; fall back to unweighted BFS if weighted search fails."""
+    path = graph.weighted_shortest_path(start, goal, weather, blocked, process_nodes)
+    if not path:
+        path = graph.weighted_shortest_path(start, goal, weather, None, process_nodes)
+    if not path:
+        path = graph.shortest_path(start, goal, weather, None)
+    return path
+
+
+def _path_frames_cost(
+    graph: MapGraph,
+    path: list[str],
+    weather: dict | None,
+    blocked: set[str],
+    process_nodes: dict[str, dict] | None,
+) -> float:
+    """Sum frame cost along a path, with weather timing and obstacle penalties."""
+    if len(path) < 2:
+        return 0.0
+    total = 0.0
+    elapsed = 0.0
+    for a, b in zip(path[:-1], path[1:]):
+        arrival = (graph.current_round + elapsed) if graph.current_round is not None else None
+        edge = graph.edge_cost(a, b, weather, None, process_nodes, arrival_round=arrival)
+        if isinf(edge):
+            edge = graph.edge_cost(a, b, None, None, process_nodes, arrival_round=arrival)
+        if isinf(edge):
+            return float("inf")
+        total += edge
+        if b in blocked:
+            total += OBSTACLE_TRAVERSAL_PENALTY
+        elapsed += edge
+    return total
+
+
+def _resolve_delivery_eta(
+    raw_eta: float,
+    graph: MapGraph,
+    current: str,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    map_profile: MapProfile | None,
+) -> float:
+    """Never let a failed path estimate collapse into inf-based force delivery."""
+    if isfinite(raw_eta):
+        return raw_eta
+    if not current:
+        return map_profile.best_route_cost if map_profile else float("inf")
+    bare = estimate_delivery_route(
+        graph, current, player, gate_node_id, terminal_node_ids,
+        None, process_nodes, processed_node_ids, set(),
+    )
+    if isfinite(bare.cost):
+        return bare.cost
+    if map_profile:
+        return map_profile.best_route_cost
+    return float("inf")
 
 
 def task_net_value(
@@ -806,17 +898,10 @@ def _weighted_path_frames(
     if start == end:
         return 0.0
     blocked = blocked_nodes or set()
-    path = graph.weighted_shortest_path(start, end, weather, blocked, process_nodes)
+    path = _find_route_segment(graph, start, end, weather, blocked, process_nodes)
     if not path:
-        path = graph.weighted_shortest_path(start, end, weather, None, process_nodes)
-    if not path or len(path) < 2:
         return float("inf")
-    total = 0.0
-    for a, b in zip(path[:-1], path[1:]):
-        total += graph.edge_cost(a, b, weather, None, process_nodes)
-        if b in blocked:
-            total += OBSTACLE_TRAVERSAL_PENALTY
-    return total
+    return _path_frames_cost(graph, path, weather, blocked, process_nodes)
 
 
 def _delivery_goal_node(
