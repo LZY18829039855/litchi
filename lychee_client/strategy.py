@@ -26,7 +26,7 @@ from lychee_client.state import (
     classify_opponent_mode, get_team_id, get_task_template_id,
     is_task_available, get_task_point_value,
     is_verify_process, is_enemy_guard, is_own_guard, guard_is_active, node_has_obstacle,
-    TASK_SCORE_TARGET, TASK_SCORE_STRETCH, MAX_TASK_DETOUR_COST,
+    TASK_SCORE_TARGET, TASK_SCORE_STRETCH, MAX_TASK_DETOUR_COST, MAX_TASK_DETOUR_CEILING,
     ROUTE_TASK_BONUS_PER_SCORE, ROUTE_TASK_COUNT_BONUS, ROUTE_HIGH_VALUE_TASK_BONUS,
     ROUTE_VISITED_BACKTRACK_PENALTY,
     ROUTE_BUCKET_BONUS_PER_SCORE, NEAR_GATE_RESOURCE_HOPS,
@@ -305,11 +305,13 @@ def _decide_action_impl(
         if is_enemy_guard(guard, my_team_id, player_id):
             continue
         obstacle_nodes.add(nid)
-    force_delivery = _should_force_delivery(
-        round_num, phase, player, graph, current_node_id,
+    delivery_slack = _delivery_slack_frames(
+        round_num, player, graph, current_node_id,
         gate_node_id, terminal_node_ids, weather,
         process_nodes, processed_node_ids,
     )
+    max_task_detour = _max_task_detour_budget(delivery_slack, phase)
+    force_delivery = delivery_slack <= 0
     guard_wait_kwargs = {
         "force_delivery": force_delivery,
         "graph": graph,
@@ -444,6 +446,7 @@ def _decide_action_impl(
                     processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
                     tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
                     enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
+                    delivery_slack=delivery_slack, max_task_detour=max_task_detour,
                 )
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -573,6 +576,7 @@ def _decide_action_impl(
                 processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
                 tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
                 enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
+                delivery_slack=delivery_slack, max_task_detour=max_task_detour,
             )
             if move_target:
                 return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -614,19 +618,20 @@ def _decide_action_impl(
         if guard_action is not None:
             return guard_action
 
-    # --- P2/P3: Task strategy — collect until stretch (110); RUSH 较早仍可做任务 ---
-    if get_task_score(player) < TASK_SCORE_STRETCH:
-        task_action = _handle_tasks(
-            match_id, round_num, player_id, player, graph,
-            current_node_id, tasks, player_id, phase, weather, blocked,
-            goal_node_id=gate_node_id, terminal_node_ids=terminal_node_ids,
-            obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
-            processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
-            failed_task_ids=failed_task_ids,
-            enemy_busy_task_ids=enemy_busy_task_ids,
-        )
-        if task_action is not None:
-            return task_action
+    # --- P2/P3: Task strategy — 交付余量内尽可能多做顺路/小绕路任务 ---
+    task_action = _handle_tasks(
+        match_id, round_num, player_id, player, graph,
+        current_node_id, tasks, player_id, phase, weather, blocked,
+        goal_node_id=gate_node_id, terminal_node_ids=terminal_node_ids,
+        obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
+        processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+        failed_task_ids=failed_task_ids,
+        enemy_busy_task_ids=enemy_busy_task_ids,
+        max_task_detour=max_task_detour,
+        allow_detour=delivery_slack > 0,
+    )
+    if task_action is not None:
+        return task_action
 
     # --- P4: Resource strategy (策略文档 §6) ---
     # Skip resource claiming when close to gate (prioritize delivery)
@@ -709,7 +714,8 @@ def _decide_action_impl(
         visited_node_ids=set() if force_delivery else visited_node_ids,
         tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
         enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
-        force_delivery=force_delivery,
+        force_delivery=force_delivery, delivery_slack=delivery_slack,
+        max_task_detour=max_task_detour,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -986,6 +992,50 @@ def _estimate_delivery_eta(
     return total
 
 
+def _delivery_slack_frames(
+    round_num: int,
+    player: dict,
+    graph: MapGraph | None,
+    current_node_id: str | None,
+    gate_node_id: str,
+    terminal_node_ids: list[str] | None,
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str] | None,
+    max_round: int = MAX_ROUND,
+) -> float:
+    """Frames left after estimated delivery ETA and safety buffer (for detour tasks)."""
+    remaining = max(0, max_round - round_num)
+    if remaining <= 0:
+        return 0.0
+    if graph is None or not current_node_id:
+        if get_task_score(player) >= TASK_SCORE_TARGET:
+            return max(0.0, remaining - FORCE_DELIVERY_LATE_REMAINING - FORCE_DELIVERY_ETA_BUFFER)
+        return float(remaining)
+    eta = _estimate_delivery_eta(
+        graph, current_node_id, player, gate_node_id,
+        terminal_node_ids or [], weather, process_nodes, processed_node_ids,
+    )
+    if eta == float("inf"):
+        return 0.0
+    return max(0.0, remaining - eta - FORCE_DELIVERY_ETA_BUFFER)
+
+
+def _max_task_detour_budget(delivery_slack: float, phase: str = "") -> int:
+    """How many detour frames we can spend on off-path tasks while still delivering."""
+    if delivery_slack <= 0:
+        return 0
+    if delivery_slack > 120:
+        budget = MAX_TASK_DETOUR_COST + int(delivery_slack * 0.18)
+    elif delivery_slack > 60:
+        budget = MAX_TASK_DETOUR_COST + int(delivery_slack * 0.12)
+    else:
+        budget = max(6, int(delivery_slack * 0.30))
+    if phase == "RUSH":
+        budget += RUSH_TASK_DETOUR_BONUS
+    return min(MAX_TASK_DETOUR_CEILING, budget)
+
+
 def _should_force_delivery(
     round_num: int,
     phase: str,
@@ -999,38 +1049,14 @@ def _should_force_delivery(
     processed_node_ids: set[str] | None = None,
     max_round: int = MAX_ROUND,
 ) -> bool:
-    """Force delivery only when time is tight or task stretch is reached.
-
-    RUSH 触发较早，不因 phase=RUSH 或 task≥90 立刻放弃做任务；
-    以 ETA 估算和剩余帧数决定是否必须冲刺交付。
-    """
-    task_score = get_task_score(player)
-    remaining = max(0, max_round - round_num)
-    if remaining <= 0:
+    """Pure delivery rush only when ETA slack is exhausted."""
+    if max(0, max_round - round_num) <= 0:
         return True
-
-    if task_score >= TASK_SCORE_STRETCH:
-        return True
-
-    if graph is None or not current_node_id:
-        return remaining <= FORCE_DELIVERY_LATE_REMAINING and task_score >= TASK_SCORE_TARGET
-
-    if task_score < 60:
-        return False
-
-    eta = _estimate_delivery_eta(
-        graph, current_node_id, player, gate_node_id,
-        terminal_node_ids or [], weather, process_nodes, processed_node_ids,
+    slack = _delivery_slack_frames(
+        round_num, player, graph, current_node_id, gate_node_id,
+        terminal_node_ids, weather, process_nodes, processed_node_ids, max_round,
     )
-    buffer = FORCE_DELIVERY_ETA_BUFFER
-
-    if eta != float("inf") and eta >= remaining - buffer:
-        return True
-
-    if remaining <= FORCE_DELIVERY_LATE_REMAINING and task_score >= TASK_SCORE_TARGET:
-        return True
-
-    return False
+    return slack <= 0
 
 
 def _find_direct_delivery_step(
@@ -1438,11 +1464,11 @@ def _use_horse_before_expensive_hop(
     return None
 
 
-def _should_use_task_aware_routing(player: dict, phase: str, force_delivery: bool) -> bool:
-    my_task_score = get_task_score(player)
-    if my_task_score >= TASK_SCORE_STRETCH:
-        return False
-    if force_delivery and my_task_score >= TASK_SCORE_TARGET:
+def _should_use_task_aware_routing(
+    player: dict, phase: str, force_delivery: bool,
+    delivery_slack: float = 999.0,
+) -> bool:
+    if delivery_slack <= 8:
         return False
     return True
 
@@ -1515,8 +1541,11 @@ def _route_task_stats(
     failed_task_ids: set[str] | None,
     enemy_busy_task_ids: set[str] | None,
     obstacle_nodes: set[str] | None,
+    max_task_detour: int | None = None,
 ) -> tuple[int, int, int]:
     """Return (task_score_sum, on_path_task_count, high_value_task_count) for a route via neighbor."""
+    if max_task_detour is None:
+        max_task_detour = MAX_TASK_DETOUR_COST
     path = graph.weighted_shortest_path(neighbor, goal_node, weather, blocked, process_nodes)
     on_path = set(path) if path else set()
     score_sum = 0
@@ -1538,7 +1567,7 @@ def _route_task_stats(
                 graph, current_node_id, task_node, gate_node_id, terminal_node_ids,
                 weather, blocked, player, process_nodes,
             )
-            if detour > MAX_TASK_DETOUR_COST:
+            if detour > max_task_detour:
                 continue
             # 顺路绕一点也算分，但不计入路线任务数量
             score_sum += get_task_point_value(task)
@@ -1597,6 +1626,7 @@ def _score_navigation_neighbor(
     obstacle_nodes: set[str] | None,
     visited_node_ids: set[str],
     bucket_scores: dict[str, int],
+    max_task_detour: int | None = None,
 ) -> float:
     hop_cost = graph.edge_cost(current_node_id, neighbor, weather, blocked, process_nodes)
     tail_cost = _weighted_path_cost(graph, neighbor, goal_node, weather, blocked, process_nodes)
@@ -1611,6 +1641,7 @@ def _score_navigation_neighbor(
         graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
         gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
         failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+        max_task_detour=max_task_detour,
     )
     score -= task_score_sum * ROUTE_TASK_BONUS_PER_SCORE
     score -= task_count * ROUTE_TASK_COUNT_BONUS
@@ -1638,6 +1669,7 @@ def _pick_task_aware_neighbor(
     enemy_busy_task_ids: set[str] | None,
     obstacle_nodes: set[str] | None,
     visited_node_ids: set[str],
+    max_task_detour: int | None = None,
 ) -> str | None:
     if not available or not goal_node:
         return None
@@ -1653,12 +1685,13 @@ def _pick_task_aware_neighbor(
             graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
             gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
             failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
-            visited_node_ids, bucket_scores,
+            visited_node_ids, bucket_scores, max_task_detour=max_task_detour,
         )
         route_stats = _route_task_stats(
             graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
             gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
             failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+            max_task_detour=max_task_detour,
         )
         if nav_score < best_score or (
             nav_score == best_score and route_stats[1] > best_stats[1]
@@ -1693,6 +1726,8 @@ def _find_move_target(
     enemy_busy_task_ids: set[str] | None = None,
     phase: str = "",
     force_delivery: bool = False,
+    delivery_slack: float = 999.0,
+    max_task_detour: int | None = None,
 ) -> str | None:
     """Find the best move target using weighted shortest path toward the current goal.
 
@@ -1742,20 +1777,22 @@ def _find_move_target(
             if nid not in processed_node_ids
         }
 
-    if goal_node and _should_use_task_aware_routing(player, phase, force_delivery):
+    if goal_node and _should_use_task_aware_routing(player, phase, force_delivery, delivery_slack):
+        if max_task_detour is None:
+            max_task_detour = _max_task_detour_budget(delivery_slack, phase)
         task_candidates = all_safe or available
         task_step = _pick_task_aware_neighbor(
             graph, current_node_id, task_candidates, goal_node, tasks, player_id, player,
             gate_node_id, terminal_node_ids, weather, guard_blocked,
             remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
-            obstacle_nodes, visited_node_ids,
+            obstacle_nodes, visited_node_ids, max_task_detour=max_task_detour,
         )
         if task_step and task_step in available:
             route_score, route_tasks, route_high = _route_task_stats(
                 graph, current_node_id, task_step, goal_node, tasks, player_id, player,
                 gate_node_id, terminal_node_ids, weather, guard_blocked,
                 remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
-                obstacle_nodes,
+                obstacle_nodes, max_task_detour=max_task_detour,
             )
             logger.info(
                 "task-aware move %s->%s (routeTasks=%d high=%d score=%d myTaskScore=%d)",
@@ -2311,8 +2348,6 @@ def _retry_task_at_current_node(
 ) -> dict | None:
     if enemy_busy_task_ids is None:
         enemy_busy_task_ids = set()
-    if get_task_score(player) >= TASK_SCORE_STRETCH:
-        return None
     if isinstance(player.get("currentProcess"), dict):
         return None
 
@@ -2372,6 +2407,8 @@ def _handle_tasks(
     visited_node_ids: set[str] | None = None,
     failed_task_ids: set[str] | None = None,
     enemy_busy_task_ids: set[str] | None = None,
+    max_task_detour: int | None = None,
+    allow_detour: bool = True,
 ) -> dict | None:
     """Handle task claiming strategy (策略文档 §5).
 
@@ -2389,19 +2426,10 @@ def _handle_tasks(
         failed_task_ids = set()
     if enemy_busy_task_ids is None:
         enemy_busy_task_ids = set()
+    if max_task_detour is None:
+        max_task_detour = MAX_TASK_DETOUR_COST
 
     my_task_score = get_task_score(player)
-    if my_task_score >= TASK_SCORE_STRETCH:
-        return None
-
-    hops_to_goal = float("inf")
-    goal = goal_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
-    if goal and graph and current_node_id:
-        hops_to_goal = graph.path_length(current_node_id, goal, weather, blocked)
-    push_phase = my_task_score < 40 and hops_to_goal > 5 and phase != "RUSH"
-    max_task_detour = MAX_TASK_DETOUR_COST
-    if phase == "RUSH" and my_task_score < TASK_SCORE_STRETCH:
-        max_task_detour += RUSH_TASK_DETOUR_BONUS
 
     if _player_processing_task(player):
         return None
@@ -2422,8 +2450,6 @@ def _handle_tasks(
     )
     if task:
         template_id = get_task_template_id(task)
-        if push_phase and not template_id.startswith(("T01", "T06", "T04")):
-            task = None
         if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
             logger.debug("Round %d: Skipping T06 task (no horse)", round_num)
             task = None
@@ -2455,8 +2481,8 @@ def _handle_tasks(
                 make_claim_task_action(task_id)
             ])
 
-    # Look for nearby tasks within detour cost (策略文档 §5.2 顺路原则)
-    if my_task_score < TASK_SCORE_STRETCH and not push_phase:
+    # Look for nearby tasks within detour budget (交付余量内尽量多拿)
+    if allow_detour and max_task_detour > 0:
         candidates = []
         for task in tasks:
             if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
