@@ -329,9 +329,10 @@ def _decide_action_impl(
     }
 
     if state != "CONTESTING" and not is_in_passive_state(player):
-        ice_use = _try_use_ice_box(match_id, round_num, player_id, player)
-        if ice_use is not None:
-            return ice_use
+        if not _should_defer_ice_box(player, last_move_error, route_blocked):
+            ice_use = _try_use_ice_box(match_id, round_num, player_id, player)
+            if ice_use is not None:
+                return ice_use
 
     if state == "CONTESTING":
         on_water_route = _is_on_water_route(graph, current_node_id, gate_node_id, terminal_node_ids)
@@ -457,7 +458,10 @@ def _decide_action_impl(
                     )
 
         if state == "MOVING":
-            if guard_target or last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
+            if guard_target or (
+                last_move_failed
+                and last_move_error in ("MOVE_BLOCKED_BY_GUARD", "MOVING_ACTION_FORBIDDEN")
+            ):
                 target = guard_target or player.get("nextNodeId", "")
                 if target:
                     return _handle_limited_state_guard_block(
@@ -2829,10 +2833,28 @@ def _calc_detour_cost(
     return int((via_task - direct) / 1000)
 
 
+def _should_defer_ice_box(
+    player: dict,
+    last_move_error: str,
+    route_blocked: set[str],
+) -> bool:
+    """边上移动或交设卡税时不能 USE_RESOURCE，须落地后再用冰鉴。"""
+    state = player.get("state", "")
+    if state == "MOVING":
+        return True
+    if state == "WAITING":
+        next_node = player.get("nextNodeId", "")
+        if _is_paying_guard_travel_tax(state, player, last_move_error, next_node, route_blocked):
+            return True
+        if next_node:
+            return True
+    return False
+
+
 def _try_use_ice_box(
     match_id: str, round_num: int, player_id: int, player: dict,
 ) -> dict | None:
-    """鲜度 < 90 时立即使用冰鉴，无其他条件。"""
+    """鲜度 < 90 时立即使用冰鉴（须在节点 IDLE 且非交设卡税状态）。"""
     if not has_resource(player, "ICE_BOX"):
         return None
     freshness = get_freshness(player)
