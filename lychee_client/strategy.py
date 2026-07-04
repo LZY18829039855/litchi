@@ -261,167 +261,26 @@ def _decide_action_impl(
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
 
         if state == "WAITING":
-            next_node = player.get("nextNodeId", "")
-            if last_move_failed and last_move_error == "OBJECT_BUSY":
-                logger.info("Round %d: OBJECT_BUSY in WAITING, sending WAIT", round_num)
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
-
-            pending_process_type = _get_pending_station_process_type(
-                current_node_id, next_node, process_nodes, processed_node_ids,
+            return _handle_waiting_state(
+                match_id, round_num, player_id, player, graph,
+                current_node_id, guard_target, route_blocked, obstacle_nodes,
+                weather, process_nodes, processed_node_ids, visited_node_ids,
+                gate_node_id, terminal_node_ids,
+                inquire_nodes, my_team_id, global_plan, force_delivery,
+                last_move_failed, last_move_error, phase,
             )
-            if pending_process_type:
-                if _has_current_process_for_node(player, current_node_id):
-                    logger.info("Round %d: station process running at %s, sending empty action", round_num, current_node_id)
-                    return make_empty_action(match_id, round_num, player_id)
-                logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
-                return _make_process_action(
-                    match_id, round_num, player_id,
-                    pending_process_type, current_node_id, phase,
-                )
-
-            if last_move_failed and last_move_error == "PROCESS_REQUIRED":
-                process_type = process_nodes.get(current_node_id, {}).get("processType") if process_nodes and current_node_id else ""
-                if process_type:
-                    logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, retrying %s", round_num, current_node_id, process_type)
-                    return _make_process_action(
-                        match_id, round_num, player_id,
-                        process_type, current_node_id, phase,
-                    )
-                logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, sending WAIT", round_num, current_node_id)
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
-
-            if not force_delivery and current_node_id and not next_node:
-                if (
-                    pending_task_hold_node_id == current_node_id
-                    and round_num <= pending_task_hold_until_round
-                ):
-                    logger.info(
-                        "Round %d: waiting for busy task at %s until %d",
-                        round_num, current_node_id, pending_task_hold_until_round,
-                    )
-                    return make_action(match_id, round_num, player_id, [make_wait_action()])
-                if pending_task_hold_node_id == current_node_id and pending_task_hold_task_id:
-                    task_retry = _retry_task_at_current_node(
-                        match_id, round_num, player_id, player, graph,
-                        current_node_id, tasks, failed_task_ids,
-                        preferred_task_id=pending_task_hold_task_id,
-                    )
-                    if task_retry is not None:
-                        return task_retry
-                task_retry = _retry_task_at_current_node(
-                    match_id, round_num, player_id, player, graph,
-                    current_node_id, tasks, failed_task_ids,
-                )
-                if task_retry is not None:
-                    return task_retry
-
-            if force_delivery and current_node_id and not next_node:
-                direct_target = _find_direct_delivery_step(
-                    graph, current_node_id, player, gate_node_id, terminal_node_ids,
-                    weather, process_nodes, processed_node_ids, route_blocked,
-                    visited_node_ids=visited_node_ids,
-                    global_plan=global_plan,
-                )
-                if direct_target:
-                    if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        nav_goal = _navigation_replan_goal(
-                            global_plan, True, player, gate_node_id,
-                            terminal_node_ids, graph, current_node_id, weather,
-                            route_blocked, process_nodes,
-                        )
-                        detour = _dynamic_progress_step(
-                            graph, current_node_id, nav_goal or "",
-                            player, gate_node_id, terminal_node_ids,
-                            weather, route_blocked, process_nodes,
-                            visited_node_ids=visited_node_ids,
-                        )
-                        if detour:
-                            logger.info("Round %d: FORCE_DELIVERY detour to %s (WAITING)", round_num, detour)
-                            return make_action(match_id, round_num, player_id, [make_move_action(detour)])
-                        return _move_and_weaken_guard(
-                            match_id, round_num, player_id, player,
-                            inquire_nodes, direct_target, my_team_id,
-                        )
-                    logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
-                    return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
-
-            if guard_target:
-                if next_node and guard_target == next_node:
-                    return _move_and_weaken_guard(
-                        match_id, round_num, player_id, player,
-                        inquire_nodes, next_node, my_team_id,
-                    )
-                return _wait_and_weaken_guard(
-                    match_id, round_num, player_id, player,
-                    inquire_nodes, guard_target, my_team_id,
-                )
-
-            if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
-                logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
-
-            if next_node:
-                if next_node in route_blocked:
-                    nav_goal = _navigation_replan_goal(
-                        global_plan, force_delivery, player, gate_node_id,
-                        terminal_node_ids, graph, current_node_id, weather,
-                        route_blocked, process_nodes,
-                    )
-                    detour = _dynamic_progress_step(
-                        graph, current_node_id, nav_goal or "",
-                        player, gate_node_id, terminal_node_ids,
-                        weather, route_blocked, process_nodes,
-                        visited_node_ids=visited_node_ids,
-                    )
-                    if detour:
-                        logger.info("Round %d: Detour to %s instead of blocked %s (WAITING)", round_num, detour, next_node)
-                        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
-                    return _move_and_weaken_guard(
-                        match_id, round_num, player_id, player,
-                        inquire_nodes, next_node, my_team_id,
-                    )
-                return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
-            if current_node_id:
-                move_target = _find_move_target(
-                    graph, current_node_id, player, gate_node_id, terminal_node_ids,
-                    weather, route_blocked, obstacle_nodes=obstacle_nodes,
-                    process_nodes=process_nodes,
-                    processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
-                    global_plan=global_plan,
-                    force_delivery=force_delivery,
-                )
-                if move_target and move_target not in route_blocked:
-                    return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
-                if move_target:
-                    nav_goal = _navigation_replan_goal(
-                        global_plan, force_delivery, player, gate_node_id,
-                        terminal_node_ids, graph, current_node_id, weather,
-                        route_blocked, process_nodes,
-                    )
-                    detour = _dynamic_progress_step(
-                        graph, current_node_id, nav_goal or "",
-                        player, gate_node_id, terminal_node_ids,
-                        weather, route_blocked, process_nodes,
-                        visited_node_ids=visited_node_ids,
-                    )
-                    if detour:
-                        logger.info("Round %d: Detour to %s instead of blocked %s (WAITING)", round_num, detour, move_target)
-                        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
-                    return _move_and_weaken_guard(
-                        match_id, round_num, player_id, player,
-                        inquire_nodes, move_target, my_team_id,
-                    )
 
         if state == "MOVING":
-            if guard_target or last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
+            if guard_target or (last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD"):
                 target = guard_target or player.get("nextNodeId", "")
-                return _continue_and_weaken_guard(
+                return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, target, my_team_id,
                 )
             moving_action = _handle_moving(match_id, round_num, player_id, player, graph, weather, phase)
             if moving_action.get("msg_data", {}).get("actions"):
                 return moving_action
+            return make_empty_action(match_id, round_num, player_id)
 
         return make_empty_action(match_id, round_num, player_id)
 
@@ -472,7 +331,7 @@ def _decide_action_impl(
             if step:
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
         # At S15, verified but no good fruit/freshness → WAIT (can't deliver)
-        return make_empty_action(match_id, round_num, player_id)
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
 
     # At S14 (gate): VERIFY_GATE in RUSH phase
     if gate_node_id and is_at_node(player, gate_node_id) and not is_verified(player):
@@ -1267,6 +1126,126 @@ def _has_current_process_for_node(player: dict, current_node_id: str | None) -> 
     return target_node_id == current_node_id or object_key.startswith(f"PROCESS:{current_node_id}:")
 
 
+def _try_guard_detour_or_wait(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    blocked_target: str,
+    global_plan: GlobalPlan | None,
+    force_delivery: bool,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    route_blocked: set[str],
+    process_nodes: dict[str, dict] | None,
+    visited_node_ids: set[str],
+    inquire_nodes: list[dict],
+    my_team_id: str,
+) -> dict:
+    """Detour around a guarded hop, or WAIT + squad weaken (roadside: no BREAK/FORCED_PASS)."""
+    nav_goal = _navigation_replan_goal(
+        global_plan, force_delivery, player, gate_node_id,
+        terminal_node_ids, graph, current_node_id, weather,
+        route_blocked, process_nodes,
+    )
+    detour = _dynamic_progress_step(
+        graph, current_node_id, nav_goal or "",
+        player, gate_node_id, terminal_node_ids,
+        weather, route_blocked, process_nodes,
+        visited_node_ids=visited_node_ids,
+    )
+    if detour:
+        logger.info("Round %d: Detour to %s instead of blocked %s (edge)", round_num, detour, blocked_target)
+        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+    return _wait_and_weaken_guard(
+        match_id, round_num, player_id, player,
+        inquire_nodes, blocked_target, my_team_id,
+    )
+
+
+def _handle_waiting_state(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str | None,
+    guard_target: str,
+    route_blocked: set[str],
+    obstacle_nodes: set[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    visited_node_ids: set[str],
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    global_plan: GlobalPlan | None,
+    force_delivery: bool,
+    last_move_failed: bool,
+    last_move_error: str,
+    phase: str,
+) -> dict:
+    """WAITING: only WAIT, MOVE (unblocked target/detour), or horse — no PROCESS/CLAIM/BREAK/FORCED_PASS."""
+    if processed_node_ids is None:
+        processed_node_ids = set()
+    if visited_node_ids is None:
+        visited_node_ids = set()
+    next_node = player.get("nextNodeId", "")
+
+    if last_move_failed and last_move_error in (
+        "OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN", "PROCESS_REQUIRED",
+    ):
+        logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
+
+    blocked_hop = ""
+    if guard_target:
+        blocked_hop = guard_target
+    elif next_node and next_node in route_blocked:
+        blocked_hop = next_node
+
+    if blocked_hop and current_node_id:
+        return _try_guard_detour_or_wait(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, blocked_hop, global_plan, force_delivery,
+            gate_node_id, terminal_node_ids, weather, route_blocked,
+            process_nodes, visited_node_ids, inquire_nodes, my_team_id,
+        )
+
+    if next_node and next_node not in route_blocked and next_node not in obstacle_nodes:
+        return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
+
+    if force_delivery and current_node_id and not next_node:
+        direct_target = _find_direct_delivery_step(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+            weather, process_nodes, processed_node_ids, route_blocked,
+            visited_node_ids=visited_node_ids,
+            global_plan=global_plan,
+        )
+        if direct_target and direct_target not in route_blocked and direct_target not in obstacle_nodes:
+            logger.info("Round %d: FORCE_DELIVERY resume move to %s (WAITING)", round_num, direct_target)
+            return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
+        if direct_target and (direct_target in route_blocked or direct_target in obstacle_nodes):
+            return _try_guard_detour_or_wait(
+                match_id, round_num, player_id, player, graph,
+                current_node_id, direct_target, global_plan, True,
+                gate_node_id, terminal_node_ids, weather, route_blocked,
+                process_nodes, visited_node_ids, inquire_nodes, my_team_id,
+            )
+
+    horse_action = _handle_moving(match_id, round_num, player_id, player, graph, weather, phase)
+    if horse_action.get("msg_data", {}).get("actions"):
+        return horse_action
+
+    logger.info("Round %d: WAITING hold on edge", round_num)
+    return make_action(match_id, round_num, player_id, [make_wait_action()])
+
+
 def _resolve_guard_block_target(
     player: dict,
     route_blocked: set[str],
@@ -1320,53 +1299,11 @@ def _wait_and_weaken_guard(
     return msg
 
 
-def _move_and_weaken_guard(
-    match_id: str,
-    round_num: int,
-    player_id: int,
-    player: dict,
-    inquire_nodes: list[dict],
-    target_node_id: str,
-    my_team_id: str,
-) -> dict:
-    """Resume a paused edge move while optionally weakening the blocking guard."""
-    msg = make_action(match_id, round_num, player_id, [make_move_action(target_node_id)])
-    squad = _make_squad_weaken_action(
-        inquire_nodes, target_node_id, my_team_id, player_id, player,
-    )
-    if squad:
-        logger.info("Round %d: MOVE + squad weaken at %s", round_num, target_node_id)
-        return _append_squad_action(msg, squad)
-    logger.info("Round %d: MOVE to %s while checking route block", round_num, target_node_id)
-    return msg
-
-
-def _continue_and_weaken_guard(
-    match_id: str,
-    round_num: int,
-    player_id: int,
-    player: dict,
-    inquire_nodes: list[dict],
-    target_node_id: str,
-    my_team_id: str,
-) -> dict:
-    """Keep natural movement progress while optionally weakening the guard."""
-    msg = make_empty_action(match_id, round_num, player_id)
-    squad = _make_squad_weaken_action(
-        inquire_nodes, target_node_id, my_team_id, player_id, player,
-    )
-    if squad:
-        logger.info("Round %d: continuing move + squad weaken at %s", round_num, target_node_id)
-        return _append_squad_action(msg, squad)
-    logger.info("Round %d: continuing move while checking route block at %s", round_num, target_node_id)
-    return msg
-
-
 def _handle_moving(
     match_id: str, round_num: int, player_id: int,
     player: dict, graph: MapGraph, weather: dict | None, phase: str,
 ) -> dict:
-    """Handle MOVING state: can use horse or rush_speed."""
+    """MOVING/WAITING: route-edge horse use only (任务书 §8.2)."""
     # Use FAST_HORSE if available and on a long road segment
     if has_resource(player, "FAST_HORSE"):
         return make_action(match_id, round_num, player_id, [

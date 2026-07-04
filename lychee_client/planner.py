@@ -39,6 +39,15 @@ MIN_RESOURCE_NET_VALUE = 6.0
 # route. Obstacles are NOT impassable: treating a choke-point block as unreachable
 # would inflate the delivery ETA to infinity and wrongly trigger force-delivery.
 OBSTACLE_TRAVERSAL_PENALTY = 15.0
+# Non-clearing side pays this many extra frames when passing a recently-cleared obstacle (任务书 §3.4).
+CLEAR_RESIDUE_TAX = 6.0
+CLEAR_RESIDUE_FRAMES = 30
+# Enemy guard defense decays by 1 every 30 frames while active (FAQ).
+GUARD_WEATHER_INTERVAL = 30
+GUARD_WEATHER_DECAY = 1
+# Squad action arrival delay: min(15, max(3, ceil(D/3))) frames (任务书 §3.4).
+SQUAD_DELAY_MIN = 3.0
+SQUAD_DELAY_MAX = 15.0
 # Rolling tactical window: evaluate multi-task routes within this frame budget.
 DEFAULT_PLANNING_HORIZON = 18.0
 MAX_SEQUENCE_TASKS = 3
