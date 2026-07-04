@@ -6,7 +6,8 @@ from typing import Any
 
 
 # Player states where MOVE/active actions are allowed
-_CAN_ACT_STATES = {"IDLE"}
+# COST_BANKRUPT: 任务书 §3.1 — 按所在节点空闲规则重新决策
+_CAN_ACT_STATES = {"IDLE", "COST_BANKRUPT"}
 
 # States where limited actions are allowed (WAIT, MOVE to target, horse, rush_speed)
 _LIMITED_ACT_STATES = {"MOVING", "WAITING"}
@@ -72,6 +73,11 @@ FORCE_DELIVERY_LATE_REMAINING = 100
 RUSH_TASK_DETOUR_BONUS = 5
 RUSH_PROTECT_FRESHNESS = 50
 INTEL_MAX_DISTANCE = 15
+WATER_ROUTE_TASK_MIN = 120
+WATER_ROUTE_NODES = frozenset({"S04", "S05"})
+OFFICIAL_MID_ROUTE_NODES = frozenset({"S03", "S07"})
+TASK_DETOUR_SLACK_RESERVE = 15
+WATER_ROUTE_NAV_PENALTY = 5000
 
 
 def get_team_id(player: dict) -> str:

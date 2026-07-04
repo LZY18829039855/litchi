@@ -24,12 +24,12 @@ ROUTE_FRESHNESS_LOSS = {
     "BRANCH": 0.065,
 }
 
-# Weather penalty multipliers (策略文档 §3.2)
-WEATHER_ROUTE_PENALTY = {
-    "HOT": {"MOUNTAIN": 1.5, "ROAD": 1.2},     # 酷暑: 山路鲜度×1.5
-    "HEAVY_RAIN": {"WATER": 1.5},               # 暴雨: 水路耗时×1.5
-    "MOUNTAIN_FOG": {"MOUNTAIN": 1.3},           # 山雾: 山路耗时×1.3
+# 任务书 §2.3.2: 天气通行倍率 → 移动耗时系数 = base × (weatherRate / 1000)
+WEATHER_PASSAGE_RATE = {
+    "HEAVY_RAIN": {"WATER": 1350},
+    "MOUNTAIN_FOG": {"MOUNTAIN": 1100},
 }
+# 酷暑 HOT 通行倍率 1000，不影响移动耗时（仅鲜度 ×1.5）
 
 # Process type cost in frames (策略文档 §4.1)
 PROCESS_COST_FRAMES = {
@@ -147,24 +147,22 @@ class MapGraph:
         # Cost in frame units: distance * routeCostFactor / 1000
         base_cost = distance * base_factor / 1000
 
-        # Apply weather penalty (协议: region=ALL/WATER/MOUNTAIN + type=HOT/HEAVY_RAIN/MOUNTAIN_FOG)
+        # 仅当前生效天气影响移动耗时（任务书 §2.5；预告天气不参与寻路）
         if weather:
-            weather_events = list(weather.get("active", [])) + list(weather.get("forecast", []))
-            for fw in weather_events:
+            for fw in weather.get("active", []):
                 weather_type = fw.get("type", "")
                 region = fw.get("region", "")
-                route_penalties = WEATHER_ROUTE_PENALTY.get(weather_type, {})
-                if not route_penalties:
+                rates = WEATHER_PASSAGE_RATE.get(weather_type, {})
+                if not rates:
                     continue
-                if region == "ALL" or region == weather_type:
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
-                elif region == "WATER" and route_type == "WATER":
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
-                elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
+                rate = rates.get(route_type)
+                if rate is None:
+                    if region == "WATER" and route_type == "WATER":
+                        rate = rates.get("WATER")
+                    elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
+                        rate = rates.get("MOUNTAIN")
+                if rate and rate > 0:
+                    base_cost *= rate / 1000.0
 
         # Add process cost penalty for the target node
         if process_nodes and to_id in process_nodes:

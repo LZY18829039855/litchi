@@ -151,12 +151,38 @@ class GameClient:
         self.send_message(msg)
         logger.info("Sent ready (round=%d)", self.start_round)
 
+    def _sync_active_contest_id(self, inquire: InquireMessage) -> None:
+        """Prefer live contests[] over cached event contestId."""
+        for contest in inquire.contests:
+            if contest.get("resolved", False):
+                continue
+            if contest.get("status") == "SUPPRESSED":
+                continue
+            red_id = contest.get("redPlayerId")
+            blue_id = contest.get("bluePlayerId")
+            if self.player_id not in (red_id, blue_id):
+                continue
+            cid = contest.get("contestId", "")
+            if cid:
+                self.active_contest_id = cid
+                return
+        if self.active_contest_id:
+            still_active = any(
+                c.get("contestId") == self.active_contest_id
+                and not c.get("resolved", False)
+                and c.get("status") != "SUPPRESSED"
+                for c in inquire.contests
+            )
+            if not still_active:
+                self.active_contest_id = ""
+
     def handle_inquire(self, inquire: InquireMessage) -> dict | None:
         """Handle inquire message: decide and send action.
 
         Returns the action message sent, or None if no action was sent.
         """
         self.round_count = inquire.round
+        self._sync_active_contest_id(inquire)
         player = inquire.find_self_player(self.player_id)
         if player is None:
             logger.warning("Self player %d not found in inquire", self.player_id)

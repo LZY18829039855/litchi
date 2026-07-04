@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from lychee_client.map_graph import MapGraph, ROUTE_FRESHNESS_LOSS
+from lychee_client.map_graph import MapGraph, ROUTE_FRESHNESS_LOSS, PROCESS_COST_FRAMES
 from lychee_client.state import (
     can_move, can_act, get_current_node_id, needs_processing,
     is_delivered, is_retired, is_verified, is_at_node, is_in_passive_state,
@@ -68,7 +68,7 @@ def _make_process_action(
     phase: str,
 ) -> dict:
     """Map processType to the correct protocol action."""
-    if process_type == "DOCK":
+    if process_type == "BOARD":
         return make_action(match_id, round_num, player_id, [make_dock_action(current_node_id)])
     if is_verify_process(process_type):
         if phase == "RUSH":
@@ -407,14 +407,11 @@ def _decide_action_impl(
                     return task_retry
 
             if force_delivery and current_node_id and not next_node:
-                move_action = _plan_force_delivery_move(
+                move_action = _plan_limited_state_force_delivery_move(
                     match_id, round_num, player_id, player, graph,
                     current_node_id, gate_node_id, terminal_node_ids,
                     weather, process_nodes, processed_node_ids,
-                    route_blocked, avoid_route_nodes, guard_stuck_rounds, guard_stuck_target,
-                    inquire_nodes, tasks, failed_task_ids, obstacle_nodes, my_team_id,
-                    forced_pass_failed_targets, last_move_failed, last_move_error,
-                    log_prefix="FORCE_DELIVERY",
+                    route_blocked, avoid_route_nodes,
                 )
                 if move_action is not None:
                     return move_action
@@ -561,6 +558,23 @@ def _decide_action_impl(
     # If already processed, skip to MOVE (even if node has processType).
     already_processed_here = current_node_id in processed_node_ids
     process_type = None if already_processed_here else _get_process_type(current_node, process_nodes, current_node_id)
+    if process_type and is_verify_process(process_type) and is_verified(player):
+        process_type = None
+
+    # 已验核且在宫门：优先前往终点交付
+    if (
+        gate_node_id
+        and is_at_node(player, gate_node_id)
+        and is_verified(player)
+        and terminal_node_ids
+    ):
+        for tid in terminal_node_ids:
+            if tid == current_node_id:
+                continue
+            step = graph.next_step_toward(current_node_id, tid, weather, None, use_weighted=True)
+            if step:
+                logger.info("Round %d: verified at gate, move to %s for delivery", round_num, step)
+                return make_action(match_id, round_num, player_id, [make_move_action(step)])
 
     if process_type:
         if last_move_failed and last_move_error == "OBJECT_BUSY":
@@ -629,6 +643,7 @@ def _decide_action_impl(
         enemy_busy_task_ids=enemy_busy_task_ids,
         max_task_detour=max_task_detour,
         allow_detour=delivery_slack > 0,
+        delivery_slack=delivery_slack,
     )
     if task_action is not None:
         return task_action
@@ -953,42 +968,49 @@ def _estimate_delivery_eta(
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str] | None,
 ) -> float:
-    """Estimate frames needed to reach delivery-ready state along the planned route."""
+    """Estimate frames to delivery-ready state along the planned route.
+
+    Only counts process frames for nodes on the chosen path, not all map process sites.
+    """
     if not current_node_id:
         return float("inf")
 
-    remaining_process = process_nodes
-    if process_nodes and processed_node_ids is not None:
-        remaining_process = {
-            nid: info for nid, info in process_nodes.items()
-            if nid not in processed_node_ids
-        }
-
     goal = _get_goal_node(
         player, gate_node_id, terminal_node_ids, graph,
-        current_node_id, weather, None, remaining_process,
+        current_node_id, weather, None, None,
     )
     if not goal:
         return 0.0
 
     path = graph.weighted_shortest_path(
-        current_node_id, goal, weather, None, remaining_process,
+        current_node_id, goal, weather, None, None,
     )
-    if not path and remaining_process is not process_nodes:
-        path = graph.weighted_shortest_path(
-            current_node_id, goal, weather, None, process_nodes,
-        )
+    if not path:
+        path = graph.shortest_path(current_node_id, goal, weather, None)
     if not path:
         return float("inf")
 
     total = sum(
-        graph.edge_cost(path[i], path[i + 1], weather, None, remaining_process)
+        graph.edge_cost(path[i], path[i + 1], weather, None, None)
         for i in range(len(path) - 1)
     )
-    if not is_verified(player) and gate_node_id:
-        total += 18
-    elif is_verified(player):
-        total += 4
+
+    processed = processed_node_ids or set()
+    proc_nodes = process_nodes or {}
+    for nid in path:
+        if nid in processed:
+            continue
+        info = proc_nodes.get(nid)
+        if not info:
+            continue
+        pt = info.get("processType", "")
+        frames = int(info.get("processRound") or PROCESS_COST_FRAMES.get(pt, 0) or 0)
+        if is_verify_process(pt):
+            if not is_verified(player):
+                total += frames
+        elif pt:
+            total += frames
+
     return total
 
 
@@ -1192,6 +1214,66 @@ def _should_detour_force_delivery(
     if direct_target in route_blocked and guard_stuck_rounds >= GUARD_SILENT_WAIT_LIMIT:
         return True
     return False
+
+
+def _plan_limited_state_force_delivery_move(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    route_blocked: set[str],
+    avoid_route_nodes: set[str],
+) -> dict | None:
+    """WAITING/MOVING 下 force delivery：仅 MOVE/WAIT/马类（任务书 §8.2）。"""
+    next_node = player.get("nextNodeId", "")
+    if next_node:
+        if next_node in route_blocked:
+            logger.info(
+                "Round %d: limited force delivery blocked hop %s, WAIT",
+                round_num, next_node,
+            )
+            return make_action(match_id, round_num, player_id, [make_wait_action()])
+        return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
+
+    target = _find_direct_delivery_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids,
+        avoid_nodes=avoid_route_nodes,
+    )
+    if target and target not in route_blocked:
+        horse_action = _use_horse_before_expensive_hop(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, target, weather, process_nodes,
+            force_delivery=True,
+        )
+        if horse_action is not None:
+            return horse_action
+        logger.info(
+            "Round %d: limited force delivery move to %s",
+            round_num, target,
+        )
+        return make_action(match_id, round_num, player_id, [make_move_action(target)])
+
+    detour = _find_delivery_detour_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids, route_blocked,
+        avoid_nodes=avoid_route_nodes,
+    )
+    if detour:
+        logger.info(
+            "Round %d: limited force delivery detour via %s",
+            round_num, detour,
+        )
+        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+
+    return make_action(match_id, round_num, player_id, [make_wait_action()])
 
 
 def _plan_force_delivery_move(
@@ -1489,6 +1571,104 @@ def _task_routable(
     return True
 
 
+def _bucket_available_task_score(
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+    route_bucket: str,
+) -> int:
+    total = 0
+    for task in tasks:
+        if not is_task_available(task, player_id, failed_task_ids, enemy_busy_task_ids):
+            continue
+        if not _task_routable(task, player, obstacle_nodes):
+            continue
+        if (task.get("routeBucket") or "ROAD") != route_bucket:
+            continue
+        total += get_task_point_value(task)
+    return total
+
+
+def _prefer_water_route(
+    player: dict,
+    tasks: list[dict],
+    player_id: int,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+) -> bool:
+    """水路需同时满足：已持有冰鉴，且可用水路任务分 ≥ WATER_ROUTE_TASK_MIN。"""
+    if not has_resource(player, "ICE_BOX"):
+        return False
+    water_score = _bucket_available_task_score(
+        tasks, player_id, player, failed_task_ids, enemy_busy_task_ids,
+        obstacle_nodes, "WATER",
+    )
+    return water_score >= WATER_ROUTE_TASK_MIN
+
+
+def _task_process_frames(task: dict) -> int:
+    template_id = get_task_template_id(task)
+    for prefix, (_score, proc_round, _spr) in TASK_PRIORITY.items():
+        if template_id.startswith(prefix):
+            return proc_round
+    return 6
+
+
+def _task_involves_backtrack(
+    task_node: str,
+    current_node_id: str,
+    visited_node_ids: set[str],
+    graph: MapGraph,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> bool:
+    """任务目标在已访问节点，或前往路径需经过已访问节点。"""
+    if task_node != current_node_id and task_node in visited_node_ids:
+        return True
+    path = graph.weighted_shortest_path(
+        current_node_id, task_node, weather, blocked, process_nodes,
+    )
+    if not path or len(path) < 2:
+        return False
+    for nid in path[1:]:
+        if nid in visited_node_ids:
+            return True
+    return False
+
+
+def _task_detour_unacceptable(
+    detour: int,
+    delivery_slack: float,
+    task: dict,
+) -> bool:
+    """绕路+读条会耗尽交付余量则不做该任务。"""
+    if delivery_slack <= TASK_DETOUR_SLACK_RESERVE:
+        return True
+    cost = detour + _task_process_frames(task)
+    return cost >= delivery_slack - TASK_DETOUR_SLACK_RESERVE
+
+
+def _filter_neighbors_for_route_preference(
+    neighbors: list[str],
+    current_node_id: str,
+    prefer_water: bool,
+) -> list[str]:
+    """未满足水路条件时优先 S03→S07 官道，不走 S04/S05 码头。"""
+    if prefer_water or not neighbors:
+        return neighbors
+    without_water_nodes = [n for n in neighbors if n not in WATER_ROUTE_NODES]
+    if without_water_nodes:
+        return without_water_nodes
+    if current_node_id == "S02" and "S03" in neighbors:
+        return [n for n in neighbors if n != "S04"] or neighbors
+    return neighbors
+
+
 def _route_bucket_task_scores(
     tasks: list[dict],
     player_id: int,
@@ -1496,6 +1676,7 @@ def _route_bucket_task_scores(
     failed_task_ids: set[str] | None,
     enemy_busy_task_ids: set[str] | None,
     obstacle_nodes: set[str] | None,
+    prefer_water: bool = True,
 ) -> dict[str, int]:
     scores: dict[str, int] = {}
     for task in tasks:
@@ -1504,6 +1685,8 @@ def _route_bucket_task_scores(
         if not _task_routable(task, player, obstacle_nodes):
             continue
         bucket = task.get("routeBucket") or "ROAD"
+        if bucket == "WATER" and not prefer_water:
+            continue
         scores[bucket] = scores.get(bucket, 0) + get_task_point_value(task)
     return scores
 
@@ -1890,13 +2073,16 @@ def _find_contest_id(
     active_contest_id: str,
 ) -> str:
     """Find the contest ID for the current player."""
-    if active_contest_id:
-        return active_contest_id
     if contests:
         for c in contests:
+            if c.get("resolved", False) or c.get("status") == "SUPPRESSED":
+                continue
             if c.get("redPlayerId") == player_id or c.get("bluePlayerId") == player_id:
-                if not c.get("resolved", False) and c.get("status") != "SUPPRESSED":
-                    return c.get("contestId", "")
+                cid = c.get("contestId", "")
+                if cid:
+                    return cid
+    if active_contest_id:
+        return active_contest_id
     if events:
         for ev in reversed(events):
             if ev.get("type") == "WINDOW_CONTEST_START":
