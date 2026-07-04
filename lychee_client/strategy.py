@@ -27,7 +27,8 @@ from lychee_client.state import (
     is_task_available, get_task_point_value,
     is_verify_process, is_enemy_guard, is_own_guard, guard_is_active, node_has_obstacle,
     TASK_SCORE_TARGET, TASK_SCORE_STRETCH, MAX_TASK_DETOUR_COST,
-    ROUTE_TASK_BONUS_PER_SCORE, ROUTE_VISITED_BACKTRACK_PENALTY,
+    ROUTE_TASK_BONUS_PER_SCORE, ROUTE_TASK_COUNT_BONUS, ROUTE_HIGH_VALUE_TASK_BONUS,
+    ROUTE_VISITED_BACKTRACK_PENALTY,
     ROUTE_BUCKET_BONUS_PER_SCORE, NEAR_GATE_RESOURCE_HOPS,
     HORSE_USE_MIN_HOP_COST, HORSE_USE_MIN_HOP_COST_EARLY,
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
@@ -35,6 +36,8 @@ from lychee_client.state import (
     SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
     MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE, GUARD_MIN_LEAD_FIRST,
     GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
+    GUARD_RESERVE_FOR_GATE, FINAL_CORRIDOR_GATE_HOPS,
+    FINAL_CORRIDOR_GUARD_MIN_LEAD, FINAL_CORRIDOR_GUARD_TASK_MIN,
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
     FORCE_DELIVERY_ETA_REMAINING_MAX,
 )
@@ -541,7 +544,7 @@ def _decide_action_impl(
             match_id, round_num, player_id, player, graph,
             current_node_id, gate_node_id, terminal_node_ids,
             weather, obstacle_nodes, inquire_nodes, my_team_id,
-            opp_player, mode, phase,
+            opp_player, mode, phase, process_nodes=process_nodes,
             force_delivery=force_delivery,
         )
         if guard_action is not None:
@@ -570,7 +573,7 @@ def _decide_action_impl(
         resource_action = _handle_resources(
             match_id, round_num, player_id, player, graph,
             current_node_id, current_node, phase, weather,
-            gate_node_id=gate_node_id,
+            gate_node_id=gate_node_id, process_nodes=process_nodes,
         )
         if resource_action is not None:
             return resource_action
@@ -1432,6 +1435,60 @@ def _weighted_path_cost(
     )
 
 
+def _route_task_stats(
+    graph: MapGraph,
+    current_node_id: str,
+    neighbor: str,
+    goal_node: str,
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+) -> tuple[int, int, int]:
+    """Return (task_score_sum, on_path_task_count, high_value_task_count) for a route via neighbor."""
+    path = graph.weighted_shortest_path(neighbor, goal_node, weather, blocked, process_nodes)
+    on_path = set(path) if path else set()
+    score_sum = 0
+    task_count = 0
+    high_count = 0
+
+    for task in tasks:
+        if not is_task_available(task, player_id, failed_task_ids, enemy_busy_task_ids):
+            continue
+        if not _task_routable(task, player, obstacle_nodes):
+            continue
+        task_node = task.get("nodeId", "")
+        if not task_node:
+            continue
+
+        on_route = task_node in on_path or task_node == neighbor
+        if not on_route:
+            detour = _calc_detour_cost(
+                graph, current_node_id, task_node, gate_node_id, terminal_node_ids,
+                weather, blocked, player, process_nodes,
+            )
+            if detour > MAX_TASK_DETOUR_COST:
+                continue
+            # 顺路绕一点也算分，但不计入路线任务数量
+            score_sum += get_task_point_value(task)
+            continue
+
+        pts = get_task_point_value(task)
+        score_sum += pts
+        task_count += 1
+        if pts >= 30:
+            high_count += 1
+
+    return score_sum, task_count, high_count
+
+
 def _neighbor_task_yield(
     graph: MapGraph,
     current_node_id: str,
@@ -1450,31 +1507,12 @@ def _neighbor_task_yield(
     obstacle_nodes: set[str] | None,
 ) -> int:
     """Sum claimable task points on the path via neighbor or within detour budget."""
-    path = graph.weighted_shortest_path(neighbor, goal_node, weather, blocked, process_nodes)
-    on_path = set(path) if path else set()
-    total = 0
-
-    for task in tasks:
-        if not is_task_available(task, player_id, failed_task_ids, enemy_busy_task_ids):
-            continue
-        if not _task_routable(task, player, obstacle_nodes):
-            continue
-        task_node = task.get("nodeId", "")
-        if not task_node:
-            continue
-
-        if task_node in on_path or task_node == neighbor:
-            total += get_task_point_value(task)
-            continue
-
-        detour = _calc_detour_cost(
-            graph, current_node_id, task_node, gate_node_id, terminal_node_ids,
-            weather, blocked, player, process_nodes,
-        )
-        if detour <= MAX_TASK_DETOUR_COST:
-            total += get_task_point_value(task)
-
-    return total
+    score_sum, _, _ = _route_task_stats(
+        graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
+        gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
+        failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+    )
+    return score_sum
 
 
 def _score_navigation_neighbor(
@@ -1505,12 +1543,14 @@ def _score_navigation_neighbor(
     if neighbor in visited_node_ids:
         score += ROUTE_VISITED_BACKTRACK_PENALTY
 
-    task_yield = _neighbor_task_yield(
+    task_score_sum, task_count, high_count = _route_task_stats(
         graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
         gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
         failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
     )
-    score -= task_yield * ROUTE_TASK_BONUS_PER_SCORE
+    score -= task_score_sum * ROUTE_TASK_BONUS_PER_SCORE
+    score -= task_count * ROUTE_TASK_COUNT_BONUS
+    score -= high_count * ROUTE_HIGH_VALUE_TASK_BONUS
 
     edge_type = graph.get_edge_route_type(current_node_id, neighbor)
     score -= bucket_scores.get(edge_type, 0) * ROUTE_BUCKET_BONUS_PER_SCORE
@@ -1543,6 +1583,7 @@ def _pick_task_aware_neighbor(
     )
     best_neighbor = None
     best_score = float("inf")
+    best_stats = (0, 0, 0)
     for neighbor in available:
         nav_score = _score_navigation_neighbor(
             graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
@@ -1550,9 +1591,22 @@ def _pick_task_aware_neighbor(
             failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
             visited_node_ids, bucket_scores,
         )
-        if nav_score < best_score:
+        route_stats = _route_task_stats(
+            graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
+            gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
+            failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+        )
+        if nav_score < best_score or (
+            nav_score == best_score and route_stats[1] > best_stats[1]
+        ):
             best_score = nav_score
             best_neighbor = neighbor
+            best_stats = route_stats
+    if best_neighbor:
+        logger.debug(
+            "route pick %s: score=%d tasks=%d high=%d nav=%.1f",
+            best_neighbor, best_stats[0], best_stats[1], best_stats[2], best_score,
+        )
     return best_neighbor
 
 
@@ -1633,15 +1687,16 @@ def _find_move_target(
             obstacle_nodes, visited_node_ids,
         )
         if task_step and task_step in available:
-            task_yield = _neighbor_task_yield(
+            route_score, route_tasks, route_high = _route_task_stats(
                 graph, current_node_id, task_step, goal_node, tasks, player_id, player,
                 gate_node_id, terminal_node_ids, weather, guard_blocked,
                 remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
                 obstacle_nodes,
             )
             logger.info(
-                "task-aware move %s->%s (yield=%d, taskScore=%d)",
-                current_node_id, task_step, task_yield, get_task_score(player),
+                "task-aware move %s->%s (routeTasks=%d high=%d score=%d myTaskScore=%d)",
+                current_node_id, task_step, route_tasks, route_high, route_score,
+                get_task_score(player),
             )
             return task_step
 
@@ -2440,6 +2495,7 @@ def _handle_resources(
     player: dict, graph: MapGraph, current_node_id: str,
     current_node: dict | None, phase: str, weather: dict | None,
     gate_node_id: str = "",
+    process_nodes: dict[str, dict] | None = None,
 ) -> dict | None:
     """Handle resource claiming strategy (策略文档 §6).
 
@@ -2450,9 +2506,10 @@ def _handle_resources(
     if phase == "RUSH" or round_num >= 360:
         return None
 
-    near_gate = False
-    if gate_node_id and current_node_id:
-        near_gate = graph.path_length(current_node_id, gate_node_id, weather, None) <= NEAR_GATE_RESOURCE_HOPS
+    hops_to_gate = _hops_to_gate(graph, current_node_id, gate_node_id, weather, None)
+    near_gate = hops_to_gate <= NEAR_GATE_RESOURCE_HOPS
+    on_final_approach = hops_to_gate <= FINAL_CORRIDOR_GATE_HOPS
+    at_palace_transfer = _is_palace_transfer_node(process_nodes, current_node_id)
 
     resources = find_available_resources(current_node)
     if not resources:
@@ -2463,8 +2520,6 @@ def _handle_resources(
     # Filter to only high-value resources worth claiming
     HIGH_VALUE_RESOURCES = {"FAST_HORSE", "SHORT_HORSE", "ICE_BOX"}
     WINDOW_RESOURCES = {"OFFICIAL_PERMIT", "PASS_TOKEN"}
-    # GUARD_RESERVE_FOR_GATE: reserve 1 permit for S14 GATE contest (策略文档 §15)
-    PERMIT_RESERVE = 1
 
     for rtype, count in resources:
         # Skip if already have this resource
@@ -2477,12 +2532,32 @@ def _handle_resources(
                 make_claim_resource_action(current_node_id, rtype)
             ])
         # Claim OFFICIAL_PERMIT/PASS_TOKEN for window contests
-        # Keep at least PERMIT_RESERVE+1 (1 for current use + reserve for GATE)
         if rtype in WINDOW_RESOURCES:
             if near_gate:
                 continue
-            total_permits = my_resources.get("OFFICIAL_PERMIT", 0) + my_resources.get("PASS_TOKEN", 0)
-            if total_permits < PERMIT_RESERVE + 1:
+            total_permits = (
+                my_resources.get("OFFICIAL_PERMIT", 0)
+                + my_resources.get("PASS_TOKEN", 0)
+            )
+            if on_final_approach:
+                if total_permits >= GUARD_RESERVE_FOR_GATE:
+                    continue
+                logger.info(
+                    "Round %d: Claiming %s at %s (final corridor gate reserve)",
+                    round_num, rtype, current_node_id,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_resource_action(current_node_id, rtype)
+                ])
+            if at_palace_transfer and total_permits < GUARD_RESERVE_FOR_GATE:
+                logger.info(
+                    "Round %d: Claiming %s at %s (palace transfer gate reserve)",
+                    round_num, rtype, current_node_id,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_resource_action(current_node_id, rtype)
+                ])
+            if total_permits < GUARD_RESERVE_FOR_GATE + 1:
                 logger.info("Round %d: Claiming resource %s at %s (for window contests)", round_num, rtype, current_node_id)
                 return make_action(match_id, round_num, player_id, [
                     make_claim_resource_action(current_node_id, rtype)
@@ -2734,19 +2809,123 @@ def _own_guard_active_at(
     return is_own_guard(_get_node_guard(inquire_nodes, node_id), my_team_id, player_id)
 
 
+def _get_inquire_node_type(node: dict | None) -> str:
+    if not node:
+        return ""
+    return str(node.get("nodeType") or node.get("type") or "")
+
+
+def _is_key_pass_node(inquire_nodes: list[dict], node_id: str) -> bool:
+    return _get_inquire_node_type(_get_inquire_node(inquire_nodes, node_id)) == "KEY_PASS"
+
+
+def _is_pass_transfer_node(process_nodes: dict[str, dict] | None, node_id: str) -> bool:
+    if not process_nodes or not node_id:
+        return False
+    return process_nodes.get(node_id, {}).get("processType") == "PASS_TRANSFER"
+
+
+def _is_palace_transfer_node(process_nodes: dict[str, dict] | None, node_id: str) -> bool:
+    if not process_nodes or not node_id:
+        return False
+    return process_nodes.get(node_id, {}).get("processType") == "PALACE_TRANSFER"
+
+
+def _hops_to_gate(
+    graph: MapGraph,
+    node_id: str,
+    gate_node_id: str,
+    weather: dict | None,
+    obstacle_nodes: set[str] | None,
+) -> float:
+    if not graph or not node_id or not gate_node_id:
+        return float("inf")
+    return graph.path_length(node_id, gate_node_id, weather, obstacle_nodes)
+
+
+def _is_in_final_corridor(
+    graph: MapGraph,
+    node_id: str,
+    gate_node_id: str,
+    weather: dict | None,
+    obstacle_nodes: set[str] | None,
+) -> bool:
+    hops = _hops_to_gate(graph, node_id, gate_node_id, weather, obstacle_nodes)
+    return hops != float("inf") and hops <= FINAL_CORRIDOR_GATE_HOPS
+
+
+def _is_final_corridor_guard_site(
+    graph: MapGraph,
+    node_id: str,
+    gate_node_id: str,
+    inquire_nodes: list[dict],
+    process_nodes: dict[str, dict] | None,
+    weather: dict | None,
+    obstacle_nodes: set[str] | None,
+) -> bool:
+    if not _is_in_final_corridor(graph, node_id, gate_node_id, weather, obstacle_nodes):
+        return False
+    if _is_key_pass_node(inquire_nodes, node_id):
+        return True
+    if _is_pass_transfer_node(process_nodes, node_id):
+        return True
+    node_type = _get_inquire_node_type(_get_inquire_node(inquire_nodes, node_id))
+    return node_type in ("PASS", "KEY_PASS")
+
+
+def _final_corridor_guard_priority(
+    graph: MapGraph,
+    node_id: str,
+    gate_node_id: str,
+    inquire_nodes: list[dict],
+    process_nodes: dict[str, dict] | None,
+    weather: dict | None,
+    obstacle_nodes: set[str] | None,
+) -> int:
+    score = 0
+    if _is_in_final_corridor(graph, node_id, gate_node_id, weather, obstacle_nodes):
+        score += 3
+    if _is_key_pass_node(inquire_nodes, node_id):
+        score += 10
+    if _is_pass_transfer_node(process_nodes, node_id):
+        score += 6
+    if gate_node_id and node_id == gate_node_id:
+        score += 8
+    return score
+
+
 def _is_key_choke_node(graph: MapGraph, node_id: str) -> bool:
     return len(graph.get_neighbors(node_id)) <= 4
 
 
-def _guard_extra_good_fruit(player: dict) -> int:
+def _guard_extra_good_fruit(
+    player: dict,
+    inquire_nodes: list[dict] | None = None,
+    current_node_id: str = "",
+    task_score: int = 0,
+) -> int:
     good = get_good_fruit(player)
-    if good >= 1 + 1 + GUARD_GOOD_FRUIT_RESERVE:
+    reserve = 1 + GUARD_GOOD_FRUIT_RESERVE
+    if (
+        inquire_nodes
+        and current_node_id
+        and _is_key_pass_node(inquire_nodes, current_node_id)
+        and task_score >= FINAL_CORRIDOR_GUARD_TASK_MIN
+        and good >= 1 + 2 + reserve
+    ):
+        return 2
+    if good >= 1 + 1 + reserve:
         return 1
     return 0
 
 
-def _guard_good_fruit_sufficient(player: dict) -> bool:
-    extra = _guard_extra_good_fruit(player)
+def _guard_good_fruit_sufficient(
+    player: dict,
+    inquire_nodes: list[dict] | None = None,
+    current_node_id: str = "",
+    task_score: int = 0,
+) -> bool:
+    extra = _guard_extra_good_fruit(player, inquire_nodes, current_node_id, task_score)
     return get_good_fruit(player) >= 1 + extra + GUARD_GOOD_FRUIT_RESERVE
 
 
@@ -2761,6 +2940,7 @@ def _evaluate_dual_guard_slot(
     my_team_id: str,
     player_id: int,
     opp_player: dict,
+    process_nodes: dict[str, dict] | None = None,
 ) -> tuple[bool, str]:
     """Dual-guard plan: guard1 then guard2, each on opp path at a choke."""
     own_guards = _list_own_active_guard_nodes(inquire_nodes, my_team_id, player_id)
@@ -2768,7 +2948,10 @@ def _evaluate_dual_guard_slot(
         return False, "max-guards"
     if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
         return False, "already-guarded"
-    if not _guard_good_fruit_sufficient(player):
+    task_score = get_task_score(player)
+    if not _guard_good_fruit_sufficient(
+        player, inquire_nodes, current_node_id, task_score,
+    ):
         return False, "low-fruit"
     if not _is_key_choke_node(graph, current_node_id):
         return False, "not-choke"
@@ -2790,9 +2973,19 @@ def _evaluate_dual_guard_slot(
     if lead < 1:
         return False, "not-leading"
 
+    final_guard_site = _is_final_corridor_guard_site(
+        graph, current_node_id, goal, inquire_nodes, process_nodes,
+        weather, obstacle_nodes,
+    )
+    min_lead_first = GUARD_MIN_LEAD_FIRST
+    if final_guard_site and task_score >= FINAL_CORRIDOR_GUARD_TASK_MIN:
+        min_lead_first = FINAL_CORRIDOR_GUARD_MIN_LEAD
+
     if len(own_guards) == 0:
-        if lead < GUARD_MIN_LEAD_FIRST:
+        if lead < min_lead_first:
             return False, "guard1-insufficient-lead"
+        if final_guard_site and _is_key_pass_node(inquire_nodes, current_node_id):
+            return True, f"final-guard1,key-pass,ahead({int(lead)})"
         return True, f"guard1,ahead({int(lead)}),opp-path,choke"
 
     first_node = own_guards[0]
@@ -2803,6 +2996,16 @@ def _evaluate_dual_guard_slot(
         return False, "guard1-lost"
     if first_guard.get("defense", 0) <= 0:
         return False, "guard1-not-active"
+
+    if (
+        final_guard_site
+        and _is_pass_transfer_node(process_nodes, current_node_id)
+        and _is_key_pass_node(inquire_nodes, first_node)
+    ):
+        return True, f"final-guard2,pass-transfer,after-{first_node}"
+
+    if final_guard_site and task_score >= FINAL_CORRIDOR_GUARD_TASK_MIN:
+        return True, f"final-guard2,after-{first_node},opp-path,choke"
 
     return True, f"guard2,after-{first_node},opp-path,choke"
 
@@ -2821,6 +3024,7 @@ def _should_set_guard_dynamic(
     opp_player: dict | None,
     mode: str,
     phase: str,
+    process_nodes: dict[str, dict] | None = None,
     force_delivery: bool = False,
 ) -> tuple[bool, str]:
     """Decide whether to SET_GUARD at the fleet's current node."""
@@ -2849,8 +3053,15 @@ def _should_set_guard_dynamic(
             return False, "max-guards"
         if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
             return False, "already-guarded"
-        if not _guard_good_fruit_sufficient(player):
+        if not _guard_good_fruit_sufficient(
+            player, inquire_nodes, current_node_id, task_score,
+        ):
             return False, "low-fruit"
+        if _is_final_corridor_guard_site(
+            graph, current_node_id, gate_node_id, inquire_nodes, process_nodes,
+            weather, obstacle_nodes,
+        ):
+            return True, "gate-fight-final-choke"
         if _is_key_choke_node(graph, current_node_id):
             return True, "gate-fight-choke"
         if gate_node_id and current_node_id == gate_node_id:
@@ -2863,6 +3074,7 @@ def _should_set_guard_dynamic(
     return _evaluate_dual_guard_slot(
         graph, current_node_id, goal, weather, obstacle_nodes,
         player, inquire_nodes, my_team_id, player_id, opp_player,
+        process_nodes=process_nodes,
     )
 
 
@@ -2916,18 +3128,23 @@ def _try_set_guard_action(
     weather: dict | None, obstacle_nodes: set[str],
     inquire_nodes: list[dict], my_team_id: str,
     opp_player: dict | None, mode: str, phase: str,
+    process_nodes: dict[str, dict] | None = None,
     force_delivery: bool = False,
 ) -> dict | None:
     should, reason = _should_set_guard_dynamic(
         graph, current_node_id, gate_node_id, terminal_node_ids,
         weather, obstacle_nodes, player, inquire_nodes,
         my_team_id, player_id, opp_player, mode, phase,
+        process_nodes=process_nodes,
         force_delivery=force_delivery,
     )
     if not should:
         return None
-    extra = _guard_extra_good_fruit(player)
-    logger.info("Round %d: Setting guard at %s (%s)", round_num, current_node_id, reason)
+    task_score = get_task_score(player)
+    extra = _guard_extra_good_fruit(
+        player, inquire_nodes, current_node_id, task_score,
+    )
+    logger.info("Round %d: Setting guard at %s (%s, extra=%d)", round_num, current_node_id, reason, extra)
     return make_action(match_id, round_num, player_id, [
         make_set_guard_action(current_node_id, extra_good_fruit=extra)
     ])
@@ -3035,8 +3252,33 @@ def _handle_combat(
                     make_squad_clear_action(clear_target)
                 ])
 
-        # SQUAD_REINFORCE: Reinforce our own guard at key nodes (策略文档 §8.4: 2人手)
+        # SQUAD_REINFORCE: Reinforce our own guard at final corridor key nodes first
         if squad_count >= SQUAD_CLEAR_MIN_SQUAD:
+            best_reinforce = ""
+            best_reinforce_score = -1
+            for node in inquire_nodes:
+                guard = node.get("guard", {})
+                owner_team = guard.get("ownerTeamId") if guard else ""
+                nid = node.get("nodeId", "")
+                if not nid or nid == current_node_id:
+                    continue
+                if not (guard and owner_team == my_team_id and guard_is_active(guard)):
+                    continue
+                score = _final_corridor_guard_priority(
+                    graph, nid, goal, inquire_nodes, process_nodes,
+                    weather, obstacle_nodes,
+                )
+                if score > best_reinforce_score:
+                    best_reinforce_score = score
+                    best_reinforce = nid
+            if best_reinforce and best_reinforce_score > 0:
+                logger.info(
+                    "Round %d: Squad reinforce at %s (final-corridor priority=%d)",
+                    round_num, best_reinforce, best_reinforce_score,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_squad_reinforce_action(best_reinforce)
+                ])
             for node in inquire_nodes:
                 guard = node.get("guard", {})
                 owner_team = guard.get("ownerTeamId") if guard else ""
@@ -3049,8 +3291,32 @@ def _handle_combat(
                         make_squad_reinforce_action(nid)
                     ])
 
-        # SQUAD_WEAKEN: Weaken enemy guard (策略文档 §8.4: 2人手, 性价比高)
+        # SQUAD_WEAKEN: Prefer enemy guards on the final corridor (KEY_PASS / PASS_TRANSFER)
         if squad_count >= 2 and opp_player:
+            best_weaken = ""
+            best_weaken_score = -1
+            for node in inquire_nodes:
+                guard = node.get("guard", {})
+                nid = node.get("nodeId", "")
+                if not nid or nid == current_node_id:
+                    continue
+                if not is_enemy_guard(guard, my_team_id, player_id):
+                    continue
+                score = _final_corridor_guard_priority(
+                    graph, nid, goal, inquire_nodes, process_nodes,
+                    weather, obstacle_nodes,
+                )
+                if score > best_weaken_score:
+                    best_weaken_score = score
+                    best_weaken = nid
+            if best_weaken and best_weaken_score > 0:
+                logger.info(
+                    "Round %d: Squad weaken at %s (final-corridor priority=%d)",
+                    round_num, best_weaken, best_weaken_score,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_squad_weaken_action(best_weaken)
+                ])
             for node in inquire_nodes:
                 guard = node.get("guard", {})
                 if (is_enemy_guard(guard, my_team_id, player_id)
