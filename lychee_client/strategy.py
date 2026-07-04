@@ -42,6 +42,8 @@ from lychee_client.state import (
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
     FORCE_DELIVERY_ETA_REMAINING_MAX, FORCE_DELIVERY_LATE_REMAINING,
     RUSH_TASK_DETOUR_BONUS,
+    WATER_ROUTE_TASK_MIN, WATER_ROUTE_NODES, OFFICIAL_MID_ROUTE_NODES,
+    TASK_DETOUR_SLACK_RESERVE, WATER_ROUTE_NAV_PENALTY,
 )
 from lychee_client.decision import (
     make_action, make_move_action, make_wait_action,
@@ -1810,6 +1812,7 @@ def _score_navigation_neighbor(
     visited_node_ids: set[str],
     bucket_scores: dict[str, int],
     max_task_detour: int | None = None,
+    prefer_water: bool = True,
 ) -> float:
     hop_cost = graph.edge_cost(current_node_id, neighbor, weather, blocked, process_nodes)
     tail_cost = _weighted_path_cost(graph, neighbor, goal_node, weather, blocked, process_nodes)
@@ -1819,6 +1822,11 @@ def _score_navigation_neighbor(
     score = hop_cost + tail_cost
     if neighbor in visited_node_ids:
         score += ROUTE_VISITED_BACKTRACK_PENALTY
+
+    if not prefer_water:
+        edge_type = graph.get_edge_route_type(current_node_id, neighbor)
+        if edge_type == "WATER" or neighbor in WATER_ROUTE_NODES:
+            score += WATER_ROUTE_NAV_PENALTY
 
     task_score_sum, task_count, high_count = _route_task_stats(
         graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
@@ -1853,12 +1861,14 @@ def _pick_task_aware_neighbor(
     obstacle_nodes: set[str] | None,
     visited_node_ids: set[str],
     max_task_detour: int | None = None,
+    prefer_water: bool = True,
 ) -> str | None:
     if not available or not goal_node:
         return None
 
     bucket_scores = _route_bucket_task_scores(
-        tasks, player_id, player, failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+        tasks, player_id, player, failed_task_ids, enemy_busy_task_ids,
+        obstacle_nodes, prefer_water=prefer_water,
     )
     best_neighbor = None
     best_score = float("inf")
@@ -1869,6 +1879,7 @@ def _pick_task_aware_neighbor(
             gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
             failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
             visited_node_ids, bucket_scores, max_task_detour=max_task_detour,
+            prefer_water=prefer_water,
         )
         route_stats = _route_task_stats(
             graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
@@ -1936,12 +1947,25 @@ def _find_move_target(
         if safe:
             all_safe = safe
     forward_available = [n for n in all_safe if n not in visited_node_ids]
+    prefer_water = _prefer_water_route(
+        player, tasks or [], player_id, failed_task_ids or set(),
+        enemy_busy_task_ids or set(), obstacle_nodes,
+    )
     if forward_available:
-        available = forward_available
+        available = _filter_neighbors_for_route_preference(
+            forward_available, current_node_id, prefer_water,
+        )
     else:
-        available = all_safe or neighbors
-    logger.info("_find_move_target: current=%s neighbors=%s available=%s visited=%s failed_target=%s",
-                current_node_id, neighbors, available, visited_node_ids, failed_target)
+        available = _filter_neighbors_for_route_preference(
+            all_safe or neighbors, current_node_id, prefer_water,
+        )
+    all_safe = _filter_neighbors_for_route_preference(
+        all_safe, current_node_id, prefer_water,
+    ) or all_safe
+    logger.info(
+        "_find_move_target: current=%s neighbors=%s available=%s visited=%s prefer_water=%s",
+        current_node_id, neighbors, available, visited_node_ids, prefer_water,
+    )
 
     if tasks is None:
         tasks = []
@@ -1969,6 +1993,7 @@ def _find_move_target(
             gate_node_id, terminal_node_ids, weather, guard_blocked,
             remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
             obstacle_nodes, visited_node_ids, max_task_detour=max_task_detour,
+            prefer_water=prefer_water,
         )
         if task_step and task_step in available:
             route_score, route_tasks, route_high = _route_task_stats(
@@ -2595,6 +2620,7 @@ def _handle_tasks(
     enemy_busy_task_ids: set[str] | None = None,
     max_task_detour: int | None = None,
     allow_detour: bool = True,
+    delivery_slack: float = 999.0,
 ) -> dict | None:
     """Handle task claiming strategy (策略文档 §5).
 
@@ -2616,6 +2642,9 @@ def _handle_tasks(
         max_task_detour = MAX_TASK_DETOUR_COST
 
     my_task_score = get_task_score(player)
+    prefer_water = _prefer_water_route(
+        player, tasks, my_player_id, failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+    )
 
     if _player_processing_task(player):
         return None
@@ -2644,6 +2673,14 @@ def _handle_tasks(
         ):
             logger.debug("Round %d: Skipping T04 at %s (no obstacle)", round_num, current_node_id)
             task = None
+        if task and not prefer_water:
+            task_node = task.get("nodeId", "")
+            if task_node in WATER_ROUTE_NODES or (task.get("routeBucket") or "ROAD") == "WATER":
+                logger.info(
+                    "Round %d: Skip water task %s at %s (waterScore<%d or no ICE_BOX)",
+                    round_num, task.get("taskId", ""), task_node, WATER_ROUTE_TASK_MIN,
+                )
+                task = None
 
     if task:
         # Check expireRound (策略文档 §5.2: 关注expireRound)
@@ -2705,36 +2742,59 @@ def _handle_tasks(
 
             # Check detour cost
             detour = _calc_detour_cost(graph, current_node_id, task_node, goal_node_id, terminal_node_ids, weather, blocked, player, process_nodes)
-            if detour <= max_task_detour:
-                # Score per round priority (策略文档 §5.1)
-                spr = 0.0
-                for prefix, (score, proc_round, score_per_round) in TASK_PRIORITY.items():
-                    if tid.startswith(prefix):
-                        spr = score_per_round
-                        break
-                candidates.append((task, detour, spr))
+            if detour > max_task_detour:
+                continue
+            if _task_involves_backtrack(
+                task_node, current_node_id, visited_node_ids, graph,
+                weather, blocked, process_nodes,
+            ):
+                logger.debug(
+                    "Round %d: Skip task %s at %s (backtrack via visited)",
+                    round_num, task.get("taskId", ""), task_node,
+                )
+                continue
+            if _task_detour_unacceptable(detour, delivery_slack, task):
+                logger.debug(
+                    "Round %d: Skip task %s at %s (detour=%d slack=%.0f)",
+                    round_num, task.get("taskId", ""), task_node, detour, delivery_slack,
+                )
+                continue
+            if not prefer_water and (
+                task_node in WATER_ROUTE_NODES or (task.get("routeBucket") or "ROAD") == "WATER"
+            ):
+                continue
+            # Score per round priority (策略文档 §5.1)
+            spr = 0.0
+            for prefix, (score, proc_round, score_per_round) in TASK_PRIORITY.items():
+                if tid.startswith(prefix):
+                    spr = score_per_round
+                    break
+            candidates.append((task, detour, spr))
 
         if candidates:
             # Sort by: score-per-round descending, then detour ascending
             candidates.sort(key=lambda x: (-x[2], x[1]))
-            best_task = candidates[0][0]
-            task_node = best_task.get("nodeId", "")
-            # Move toward task: avoid obstacles/guards, but do not block visited nodes
-            soft_blocked = set(obstacle_nodes)
-            if blocked:
-                soft_blocked.update(blocked)
-            soft_blocked.discard(task_node)
-            step = graph.next_step_toward(
-                current_node_id, task_node, weather, soft_blocked,
-                use_weighted=True, process_nodes=process_nodes,
-            )
-            if not step:
+            for best_task, _detour, _spr in candidates:
+                task_node = best_task.get("nodeId", "")
+                soft_blocked = set(obstacle_nodes)
+                if blocked:
+                    soft_blocked.update(blocked)
+                soft_blocked.discard(task_node)
                 step = graph.next_step_toward(
-                    current_node_id, task_node, weather, obstacle_nodes,
+                    current_node_id, task_node, weather, soft_blocked,
                     use_weighted=True, process_nodes=process_nodes,
                 )
-            if step:
-                logger.info("Round %d: Moving toward task at %s (template=%s), step=%s", round_num, task_node, get_task_template_id(best_task), step)
+                if not step:
+                    step = graph.next_step_toward(
+                        current_node_id, task_node, weather, obstacle_nodes,
+                        use_weighted=True, process_nodes=process_nodes,
+                    )
+                if not step or step in visited_node_ids:
+                    continue
+                logger.info(
+                    "Round %d: Moving toward task at %s (template=%s), step=%s",
+                    round_num, task_node, get_task_template_id(best_task), step,
+                )
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
 
     return None
