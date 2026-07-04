@@ -34,6 +34,7 @@ from lychee_client.state import (
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
     RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY, MAX_ROUND,
     SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
+    GATE_CORRIDOR_NODES, GATE_CORRIDOR_ORDER, GATE_CORRIDOR_SQUAD_MIN,
     MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE, GUARD_MIN_LEAD_FIRST,
     GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
     GUARD_RESERVE_FOR_GATE, FINAL_CORRIDOR_GATE_HOPS,
@@ -91,6 +92,54 @@ def _append_squad_action(
         actions = [squad_action]
     action_msg["msg_data"]["actions"] = actions
     return action_msg
+
+
+def _find_gate_corridor_obstacle(
+    inquire_nodes: list[dict],
+    squad_clear_pending: set[str],
+) -> str | None:
+    """Return first obstacle on mandatory S10-S14 corridor (upstream first)."""
+    obstacle_at: set[str] = set()
+    for node in inquire_nodes:
+        nid = node.get("nodeId", "")
+        if nid and node_has_obstacle(node):
+            obstacle_at.add(nid)
+    for nid in GATE_CORRIDOR_ORDER:
+        if nid in GATE_CORRIDOR_NODES and nid in obstacle_at and nid not in squad_clear_pending:
+            return nid
+    return None
+
+
+def _maybe_append_gate_corridor_squad_clear(
+    action_msg: dict,
+    player: dict,
+    phase: str,
+    inquire_nodes: list[dict],
+    squad_clear_pending: set[str],
+    round_num: int,
+) -> dict:
+    """Append SQUAD_CLEAR for S10-S14 corridor obstacles without blocking main action."""
+    if phase == "RUSH":
+        return action_msg
+    if is_retired(player) or is_delivered(player):
+        return action_msg
+    if is_in_passive_state(player) or player.get("state") == "CONTESTING":
+        return action_msg
+    if get_squad_count(player) < GATE_CORRIDOR_SQUAD_MIN:
+        return action_msg
+    actions = action_msg.get("msg_data", {}).get("actions", [])
+    if len(actions) >= 2:
+        return action_msg
+    if any(a.get("action", "").startswith("SQUAD_") for a in actions):
+        return action_msg
+    target = _find_gate_corridor_obstacle(inquire_nodes, squad_clear_pending)
+    if not target:
+        return action_msg
+    logger.info(
+        "Round %d: SQUAD_CLEAR at %s (mandatory gate corridor S10-S14)",
+        round_num, target,
+    )
+    return _append_squad_action(action_msg, make_squad_clear_action(target))
 
 
 def decide_action(
@@ -162,7 +211,7 @@ def decide_action(
         own_guard_sites = set()
 
     try:
-        return _decide_action_impl(
+        action_msg = _decide_action_impl(
             match_id, round_num, player_id, player, graph,
             current_node, process_nodes, contests, events,
             active_contest_id, last_move_failed, last_move_error,
@@ -172,6 +221,9 @@ def decide_action(
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
             forced_pass_failed_targets, squad_clear_pending,
             guard_stuck_rounds, guard_stuck_target, own_guard_sites,
+        )
+        return _maybe_append_gate_corridor_squad_clear(
+            action_msg, player, phase, inquire_nodes, squad_clear_pending, round_num,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -2752,6 +2804,8 @@ def _score_squad_clear_target(
     opp_path: list[str],
 ) -> float:
     """Higher score = more valuable to clear (own route, opponent tax, shared choke)."""
+    if node_id in GATE_CORRIDOR_NODES:
+        return 25.0
     on_my_path = node_id in my_path
     on_opp_path = bool(opp_path) and node_id in opp_path
     score = 0.0
@@ -2781,7 +2835,7 @@ def _find_squad_clear_target(
     squad_clear_pending: set[str],
 ) -> str | None:
     """Pick obstacle node for SQUAD_CLEAR: own route first, then opponent tax routes."""
-    if squad_count < SQUAD_CLEAR_MIN_SQUAD:
+    if squad_count < GATE_CORRIDOR_SQUAD_MIN:
         return None
 
     my_path = _path_nodes_to_goal(
@@ -2803,18 +2857,24 @@ def _find_squad_clear_target(
         nid = node.get("nodeId", "")
         if not nid or nid == current_node_id or nid in squad_clear_pending:
             continue
-        if _node_has_planned_t04(tasks, nid, failed_task_ids, my_task_score):
+        if nid not in GATE_CORRIDOR_NODES and _node_has_planned_t04(tasks, nid, failed_task_ids, my_task_score):
             continue
 
         score = _score_squad_clear_target(nid, my_path, opp_path)
+        if nid in GATE_CORRIDOR_NODES:
+            min_squad = GATE_CORRIDOR_SQUAD_MIN
+        else:
+            min_squad = SQUAD_CLEAR_MIN_SQUAD
+        if squad_count < min_squad:
+            continue
         if score <= 0:
             continue
 
         # Tight squad budget: only clear obstacles on our own planned route.
-        if squad_count <= SQUAD_CLEAR_MIN_SQUAD + 1 and score < 12.0:
+        if nid not in GATE_CORRIDOR_NODES and squad_count <= SQUAD_CLEAR_MIN_SQUAD + 1 and score < 12.0:
             continue
         # Moderate budget: require value on at least one meaningful path.
-        if score < 9.0:
+        if nid not in GATE_CORRIDOR_NODES and score < 9.0:
             continue
 
         if score > best_score:
@@ -3264,8 +3324,8 @@ def _handle_combat(
                             make_squad_scout_action(nid)
                         ])
 
-        # SQUAD_CLEAR: own-route opening + opponent-route tax; keep late-game reserve.
-        if squad_count >= SQUAD_CLEAR_MIN_SQUAD and goal:
+        # SQUAD_CLEAR: own-route opening + opponent-route tax; S10-S14 corridor first.
+        if squad_count >= GATE_CORRIDOR_SQUAD_MIN and goal:
             clear_target = _find_squad_clear_target(
                 graph, current_node_id, goal, inquire_nodes, obstacle_nodes,
                 weather, opp_player, tasks, failed_task_ids, my_task_score,
