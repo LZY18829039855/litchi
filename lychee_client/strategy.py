@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from lychee_client.map_graph import MapGraph, ROUTE_FRESHNESS_LOSS, PROCESS_COST_FRAMES
+from lychee_client.map_gameplay import MapGameplayContext, MapStrategyProfile, default_map_gameplay
 from lychee_client.state import (
     can_move, can_act, get_current_node_id, needs_processing,
     is_delivered, is_retired, is_verified, is_at_node, is_in_passive_state,
@@ -42,8 +43,8 @@ from lychee_client.state import (
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
     FORCE_DELIVERY_ETA_REMAINING_MAX, FORCE_DELIVERY_LATE_REMAINING,
     RUSH_TASK_DETOUR_BONUS,
-    WATER_ROUTE_TASK_MIN, WATER_ROUTE_NODES, OFFICIAL_MID_ROUTE_NODES,
-    TASK_DETOUR_SLACK_RESERVE, WATER_ROUTE_NAV_PENALTY,
+    WATER_ROUTE_TASK_MIN,
+    TASK_DETOUR_SLACK_RESERVE, WATER_ROUTE_NAV_PENALTY, INTEL_MAX_DISTANCE,
 )
 from lychee_client.decision import (
     make_action, make_move_action, make_wait_action,
@@ -55,10 +56,58 @@ from lychee_client.decision import (
     make_use_resource_action,
     make_squad_scout_action, make_squad_clear_action,
     make_squad_reinforce_action, make_squad_weaken_action,
-    make_rush_protect_action,
+    make_rush_protect_action, make_rush_speed_action,
 )
 
 logger = logging.getLogger("lychee_client.strategy")
+
+
+def _map_ctx(map_gameplay: MapGameplayContext | None) -> MapGameplayContext:
+    return map_gameplay if map_gameplay is not None else default_map_gameplay()
+
+
+def _profile(map_gameplay: MapGameplayContext | None) -> MapStrategyProfile:
+    return _map_ctx(map_gameplay).profile
+
+
+def _ice_threshold(map_gameplay: MapGameplayContext | None) -> float:
+    prof = _profile(map_gameplay)
+    threshold = prof.ice_box_freshness_threshold
+    if threshold > 0:
+        return threshold
+    return ICE_BOX_FRESHNESS_THRESHOLD
+
+
+def _ice_rush_threshold(map_gameplay: MapGameplayContext | None) -> float:
+    prof = _profile(map_gameplay)
+    threshold = getattr(prof, "ice_box_rush_use_threshold", 0.0)
+    if threshold > 0:
+        return threshold
+    return 95.0
+
+
+def _water_task_min(map_gameplay: MapGameplayContext | None) -> int:
+    prof = _profile(map_gameplay)
+    if prof.water_route_task_min > 0:
+        return prof.water_route_task_min
+    return WATER_ROUTE_TASK_MIN
+
+
+def _force_delivery_buffer(map_gameplay: MapGameplayContext | None) -> float:
+    prof = _profile(map_gameplay)
+    if prof.force_delivery_slack_buffer > 0:
+        return prof.force_delivery_slack_buffer
+    return FORCE_DELIVERY_ETA_BUFFER
+
+
+def _has_move_speed_buff(player: dict) -> bool:
+    for buff in player.get("buffs", []) or []:
+        if not isinstance(buff, dict):
+            continue
+        bt = str(buff.get("buffType") or buff.get("type") or "").upper()
+        if "HORSE" in bt or bt in ("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED", "MOVE_SPEED"):
+            return True
+    return False
 
 
 def _make_process_action(
@@ -99,8 +148,13 @@ def _append_squad_action(
 def _find_gate_corridor_obstacle(
     inquire_nodes: list[dict],
     squad_clear_pending: set[str],
+    graph: MapGraph | None = None,
+    current_node_id: str = "",
+    gate_node_id: str = "",
+    weather: dict | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> str | None:
-    """Return first obstacle on mandatory S10-S14 corridor (upstream first)."""
+    """Return first obstacle on S10-S14 corridor, then on planned path candidates."""
     obstacle_at: set[str] = set()
     for node in inquire_nodes:
         nid = node.get("nodeId", "")
@@ -108,6 +162,18 @@ def _find_gate_corridor_obstacle(
             obstacle_at.add(nid)
     for nid in GATE_CORRIDOR_ORDER:
         if nid in GATE_CORRIDOR_NODES and nid in obstacle_at and nid not in squad_clear_pending:
+            return nid
+
+    ctx = _map_ctx(map_gameplay)
+    if not graph or not current_node_id or not gate_node_id or not ctx.obstacle_candidate_node_ids:
+        return None
+    path = graph.shortest_path(current_node_id, gate_node_id, weather, obstacle_at)
+    for nid in path:
+        if (
+            nid in ctx.obstacle_candidate_node_ids
+            and nid in obstacle_at
+            and nid not in squad_clear_pending
+        ):
             return nid
     return None
 
@@ -119,8 +185,13 @@ def _maybe_append_gate_corridor_squad_clear(
     inquire_nodes: list[dict],
     squad_clear_pending: set[str],
     round_num: int,
+    graph: MapGraph | None = None,
+    current_node_id: str = "",
+    gate_node_id: str = "",
+    weather: dict | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict:
-    """Append SQUAD_CLEAR for S10-S14 corridor obstacles without blocking main action."""
+    """Append SQUAD_CLEAR for corridor / planned-route obstacles without blocking main action."""
     if phase == "RUSH":
         return action_msg
     if is_retired(player) or is_delivered(player):
@@ -134,11 +205,14 @@ def _maybe_append_gate_corridor_squad_clear(
         return action_msg
     if any(a.get("action", "").startswith("SQUAD_") for a in actions):
         return action_msg
-    target = _find_gate_corridor_obstacle(inquire_nodes, squad_clear_pending)
+    target = _find_gate_corridor_obstacle(
+        inquire_nodes, squad_clear_pending, graph, current_node_id, gate_node_id,
+        weather, map_gameplay,
+    )
     if not target:
         return action_msg
     logger.info(
-        "Round %d: SQUAD_CLEAR at %s (mandatory gate corridor S10-S14)",
+        "Round %d: SQUAD_CLEAR at %s (gate corridor or planned-route obstacle)",
         round_num, target,
     )
     return _append_squad_action(action_msg, make_squad_clear_action(target))
@@ -178,6 +252,7 @@ def decide_action(
     guard_stuck_rounds: int = 0,
     guard_stuck_target: str = "",
     own_guard_sites: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -223,9 +298,11 @@ def decide_action(
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
             forced_pass_failed_targets, squad_clear_pending,
             guard_stuck_rounds, guard_stuck_target, own_guard_sites,
+            map_gameplay,
         )
         return _maybe_append_gate_corridor_squad_clear(
             action_msg, player, phase, inquire_nodes, squad_clear_pending, round_num,
+            graph, get_current_node_id(player) or "", gate_node_id, weather, map_gameplay,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -266,6 +343,7 @@ def _decide_action_impl(
     guard_stuck_rounds: int = 0,
     guard_stuck_target: str = "",
     own_guard_sites: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -311,9 +389,12 @@ def _decide_action_impl(
         round_num, player, graph, current_node_id,
         gate_node_id, terminal_node_ids, weather,
         process_nodes, processed_node_ids,
+        route_blocked=route_blocked,
+        map_gameplay=map_gameplay,
     )
     max_task_detour = _max_task_detour_budget(delivery_slack, phase)
-    force_delivery = delivery_slack <= 0
+    force_buffer = _force_delivery_buffer(map_gameplay)
+    force_delivery = delivery_slack <= force_buffer
     guard_wait_kwargs = {
         "force_delivery": force_delivery,
         "graph": graph,
@@ -330,7 +411,12 @@ def _decide_action_impl(
 
     if state != "CONTESTING" and not is_in_passive_state(player):
         if not _should_defer_ice_box(player, last_move_error, route_blocked):
-            ice_use = _try_use_ice_box(match_id, round_num, player_id, player)
+            ice_use = _try_use_ice_box(
+                match_id, round_num, player_id, player, map_gameplay,
+                phase=phase, force_delivery=force_delivery,
+                graph=graph, current_node_id=current_node_id,
+                weather=weather, gate_node_id=gate_node_id,
+            )
             if ice_use is not None:
                 return ice_use
 
@@ -447,6 +533,7 @@ def _decide_action_impl(
                     tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
                     enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
                     delivery_slack=delivery_slack, max_task_detour=max_task_detour,
+                    map_gameplay=map_gameplay,
                 )
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -547,13 +634,18 @@ def _decide_action_impl(
     if gate_node_id and is_at_node(player, gate_node_id) and not is_verified(player):
         if phase == "RUSH":
             action = make_verify_gate_action(current_node_id)
+            use_break = False
             for node in inquire_nodes:
                 if node.get("nodeId") == gate_node_id:
                     guard = node.get("guard")
                     if is_enemy_guard(guard, my_team_id, player_id):
-                        if get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1:
-                            action["rushTactic"] = "BREAK_ORDER"
+                        use_break = True
                     break
+            if not use_break and delivery_slack <= force_buffer + 15:
+                if get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1:
+                    use_break = True
+            if use_break and (get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1):
+                action["rushTactic"] = "BREAK_ORDER"
             return make_action(match_id, round_num, player_id, [action])
         # Not RUSH yet: don't submit VERIFY_GATE (will be rejected)
         # Continue doing other things until RUSH
@@ -597,6 +689,7 @@ def _decide_action_impl(
                 tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
                 enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
                 delivery_slack=delivery_slack, max_task_detour=max_task_detour,
+                map_gameplay=map_gameplay,
             )
             if move_target:
                 return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -626,17 +719,8 @@ def _decide_action_impl(
             weather, blocked_soft, inquire_nodes, process_nodes=process_nodes,
         )
 
-    # --- Dual guard (before optional tasks): set at choke on opp path, then advance separately ---
-    if not force_delivery:
-        guard_action = _try_set_guard_action(
-            match_id, round_num, player_id, player, graph,
-            current_node_id, gate_node_id, terminal_node_ids,
-            weather, obstacle_nodes, inquire_nodes, my_team_id,
-            opp_player, mode, phase, process_nodes=process_nodes,
-            force_delivery=force_delivery,
-        )
-        if guard_action is not None:
-            return guard_action
+    # --- Dual guard: only after task score target (unless gate fight) ---
+    # (moved below task handling)
 
     # --- P2/P3: Task strategy — 交付余量内尽可能多做顺路/小绕路任务 ---
     task_action = _handle_tasks(
@@ -650,9 +734,22 @@ def _decide_action_impl(
         max_task_detour=max_task_detour,
         allow_detour=delivery_slack > 0,
         delivery_slack=delivery_slack,
+        map_gameplay=map_gameplay,
     )
     if task_action is not None:
         return task_action
+
+    if not force_delivery:
+        guard_action = _try_set_guard_action(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
+            weather, obstacle_nodes, inquire_nodes, my_team_id,
+            opp_player, mode, phase, process_nodes=process_nodes,
+            force_delivery=force_delivery,
+            map_gameplay=map_gameplay,
+        )
+        if guard_action is not None:
+            return guard_action
 
     # --- P4: Resource strategy (策略文档 §6) ---
     # Skip resource claiming when close to gate (prioritize delivery)
@@ -664,6 +761,7 @@ def _decide_action_impl(
             match_id, round_num, player_id, player, graph,
             current_node_id, current_node, phase, weather,
             gate_node_id=gate_node_id, process_nodes=process_nodes,
+            map_gameplay=map_gameplay,
         )
         if resource_action is not None:
             return resource_action
@@ -681,6 +779,9 @@ def _decide_action_impl(
         match_id, round_num, player_id, player,
         current_node_id, graph, weather, phase,
         gate_node_id, terminal_node_ids, process_nodes, processed_node_ids,
+        map_gameplay=map_gameplay,
+        inquire_nodes=inquire_nodes,
+        visited_node_ids=visited_node_ids,
     )
     if use_res_action is not None:
         return use_res_action
@@ -698,6 +799,7 @@ def _decide_action_impl(
             tasks=tasks,
             failed_task_ids=failed_task_ids,
             squad_clear_pending=squad_clear_pending,
+            map_gameplay=map_gameplay,
         )
         if combat_action is not None:
             return combat_action
@@ -711,6 +813,7 @@ def _decide_action_impl(
         obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
         processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
         rush_speed_failed=rush_speed_failed,
+        map_gameplay=map_gameplay,
     )
     if rush_action is not None:
         return rush_action
@@ -737,6 +840,7 @@ def _decide_action_impl(
         enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
         force_delivery=force_delivery, delivery_slack=delivery_slack,
         max_task_detour=max_task_detour,
+        map_gameplay=map_gameplay,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -973,6 +1077,7 @@ def _estimate_delivery_eta(
     weather: dict | None,
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str] | None,
+    route_blocked: set[str] | None = None,
 ) -> float:
     """Estimate frames to delivery-ready state along the planned route.
 
@@ -981,23 +1086,24 @@ def _estimate_delivery_eta(
     if not current_node_id:
         return float("inf")
 
+    blocked = route_blocked or set()
     goal = _get_goal_node(
         player, gate_node_id, terminal_node_ids, graph,
-        current_node_id, weather, None, None,
+        current_node_id, weather, blocked, None,
     )
     if not goal:
         return 0.0
 
     path = graph.weighted_shortest_path(
-        current_node_id, goal, weather, None, None,
+        current_node_id, goal, weather, blocked, None,
     )
     if not path:
-        path = graph.shortest_path(current_node_id, goal, weather, None)
+        path = graph.shortest_path(current_node_id, goal, weather, blocked)
     if not path:
         return float("inf")
 
     total = sum(
-        graph.edge_cost(path[i], path[i + 1], weather, None, None)
+        graph.edge_cost(path[i], path[i + 1], weather, blocked, None)
         for i in range(len(path) - 1)
     )
 
@@ -1031,22 +1137,26 @@ def _delivery_slack_frames(
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str] | None,
     max_round: int = MAX_ROUND,
+    route_blocked: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> float:
     """Frames left after estimated delivery ETA and safety buffer (for detour tasks)."""
+    eta_buffer = _force_delivery_buffer(map_gameplay)
     remaining = max(0, max_round - round_num)
     if remaining <= 0:
         return 0.0
     if graph is None or not current_node_id:
         if get_task_score(player) >= TASK_SCORE_TARGET:
-            return max(0.0, remaining - FORCE_DELIVERY_LATE_REMAINING - FORCE_DELIVERY_ETA_BUFFER)
+            return max(0.0, remaining - FORCE_DELIVERY_LATE_REMAINING - eta_buffer)
         return float(remaining)
     eta = _estimate_delivery_eta(
         graph, current_node_id, player, gate_node_id,
         terminal_node_ids or [], weather, process_nodes, processed_node_ids,
+        route_blocked=route_blocked,
     )
     if eta == float("inf"):
         return 0.0
-    return max(0.0, remaining - eta - FORCE_DELIVERY_ETA_BUFFER)
+    return max(0.0, remaining - eta - eta_buffer)
 
 
 def _max_task_detour_budget(delivery_slack: float, phase: str = "") -> int:
@@ -1076,15 +1186,19 @@ def _should_force_delivery(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
     max_round: int = MAX_ROUND,
+    route_blocked: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> bool:
-    """Pure delivery rush only when ETA slack is exhausted."""
+    """Pure delivery rush when ETA slack falls below the map-specific buffer."""
     if max(0, max_round - round_num) <= 0:
         return True
     slack = _delivery_slack_frames(
         round_num, player, graph, current_node_id, gate_node_id,
         terminal_node_ids, weather, process_nodes, processed_node_ids, max_round,
+        route_blocked=route_blocked,
+        map_gameplay=map_gameplay,
     )
-    return slack <= 0
+    return slack <= _force_delivery_buffer(map_gameplay)
 
 
 def _find_direct_delivery_step(
@@ -1605,15 +1719,17 @@ def _prefer_water_route(
     failed_task_ids: set[str] | None,
     enemy_busy_task_ids: set[str] | None,
     obstacle_nodes: set[str] | None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> bool:
-    """水路需同时满足：已持有冰鉴，且可用水路任务分 ≥ WATER_ROUTE_TASK_MIN。"""
-    if not has_resource(player, "ICE_BOX"):
+    """Prefer water when enough WATER-bucket task score is available."""
+    prof = _profile(map_gameplay)
+    if prof.require_ice_for_water and not has_resource(player, "ICE_BOX"):
         return False
     water_score = _bucket_available_task_score(
         tasks, player_id, player, failed_task_ids, enemy_busy_task_ids,
         obstacle_nodes, "WATER",
     )
-    return water_score >= WATER_ROUTE_TASK_MIN
+    return water_score >= _water_task_min(map_gameplay)
 
 
 def _task_process_frames(task: dict) -> int:
@@ -1659,19 +1775,36 @@ def _task_detour_unacceptable(
     return cost >= delivery_slack - TASK_DETOUR_SLACK_RESERVE
 
 
+def _is_water_task_location(
+    task_node: str,
+    task: dict,
+    map_gameplay: MapGameplayContext | None,
+) -> bool:
+    ctx = _map_ctx(map_gameplay)
+    return task_node in ctx.water_route_nodes or (task.get("routeBucket") or "ROAD") == "WATER"
+
+
 def _filter_neighbors_for_route_preference(
     neighbors: list[str],
     current_node_id: str,
     prefer_water: bool,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> list[str]:
-    """未满足水路条件时优先 S03→S07 官道，不走 S04/S05 码头。"""
+    """未满足水路条件时尽量避开水路，已在链路上时不切断。"""
     if prefer_water or not neighbors:
         return neighbors
-    without_water_nodes = [n for n in neighbors if n not in WATER_ROUTE_NODES]
-    if without_water_nodes:
-        return without_water_nodes
-    if current_node_id == "S02" and "S03" in neighbors:
-        return [n for n in neighbors if n != "S04"] or neighbors
+    ctx = _map_ctx(map_gameplay)
+    on_water_chain = current_node_id in ctx.water_route_nodes
+    if on_water_chain:
+        water_neighbors = [n for n in neighbors if n in ctx.water_route_nodes]
+        if water_neighbors:
+            return water_neighbors
+    without_water = [n for n in neighbors if n not in ctx.water_route_nodes]
+    if without_water:
+        neighbors = without_water
+    official = [n for n in neighbors if n in ctx.official_mid_route_nodes]
+    if official:
+        return official
     return neighbors
 
 
@@ -1817,6 +1950,7 @@ def _score_navigation_neighbor(
     bucket_scores: dict[str, int],
     max_task_detour: int | None = None,
     prefer_water: bool = True,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> float:
     hop_cost = graph.edge_cost(current_node_id, neighbor, weather, blocked, process_nodes)
     tail_cost = _weighted_path_cost(graph, neighbor, goal_node, weather, blocked, process_nodes)
@@ -1829,7 +1963,8 @@ def _score_navigation_neighbor(
 
     if not prefer_water:
         edge_type = graph.get_edge_route_type(current_node_id, neighbor)
-        if edge_type == "WATER" or neighbor in WATER_ROUTE_NODES:
+        water_nodes = _map_ctx(map_gameplay).water_route_nodes
+        if edge_type == "WATER" or neighbor in water_nodes:
             score += WATER_ROUTE_NAV_PENALTY
 
     task_score_sum, task_count, high_count = _route_task_stats(
@@ -1866,6 +2001,7 @@ def _pick_task_aware_neighbor(
     visited_node_ids: set[str],
     max_task_detour: int | None = None,
     prefer_water: bool = True,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> str | None:
     if not available or not goal_node:
         return None
@@ -1883,7 +2019,7 @@ def _pick_task_aware_neighbor(
             gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
             failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
             visited_node_ids, bucket_scores, max_task_detour=max_task_detour,
-            prefer_water=prefer_water,
+            prefer_water=prefer_water, map_gameplay=map_gameplay,
         )
         route_stats = _route_task_stats(
             graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
@@ -1926,6 +2062,7 @@ def _find_move_target(
     force_delivery: bool = False,
     delivery_slack: float = 999.0,
     max_task_detour: int | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> str | None:
     """Find the best move target using weighted shortest path toward the current goal.
 
@@ -1954,17 +2091,18 @@ def _find_move_target(
     prefer_water = _prefer_water_route(
         player, tasks or [], player_id, failed_task_ids or set(),
         enemy_busy_task_ids or set(), obstacle_nodes,
+        map_gameplay=map_gameplay,
     )
     if forward_available:
         available = _filter_neighbors_for_route_preference(
-            forward_available, current_node_id, prefer_water,
+            forward_available, current_node_id, prefer_water, map_gameplay,
         )
     else:
         available = _filter_neighbors_for_route_preference(
-            all_safe or neighbors, current_node_id, prefer_water,
+            all_safe or neighbors, current_node_id, prefer_water, map_gameplay,
         )
     all_safe = _filter_neighbors_for_route_preference(
-        all_safe, current_node_id, prefer_water,
+        all_safe, current_node_id, prefer_water, map_gameplay,
     ) or all_safe
     logger.info(
         "_find_move_target: current=%s neighbors=%s available=%s visited=%s prefer_water=%s",
@@ -1997,7 +2135,7 @@ def _find_move_target(
             gate_node_id, terminal_node_ids, weather, guard_blocked,
             remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
             obstacle_nodes, visited_node_ids, max_task_detour=max_task_detour,
-            prefer_water=prefer_water,
+            prefer_water=prefer_water, map_gameplay=map_gameplay,
         )
         if task_step and task_step in available:
             route_score, route_tasks, route_high = _route_task_stats(
@@ -2625,6 +2763,7 @@ def _handle_tasks(
     max_task_detour: int | None = None,
     allow_detour: bool = True,
     delivery_slack: float = 999.0,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict | None:
     """Handle task claiming strategy (策略文档 §5).
 
@@ -2645,9 +2784,11 @@ def _handle_tasks(
     if max_task_detour is None:
         max_task_detour = MAX_TASK_DETOUR_COST
 
+    water_nodes = _map_ctx(map_gameplay).water_route_nodes
     my_task_score = get_task_score(player)
     prefer_water = _prefer_water_route(
         player, tasks, my_player_id, failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+        map_gameplay=map_gameplay,
     )
 
     if _player_processing_task(player):
@@ -2679,10 +2820,10 @@ def _handle_tasks(
             task = None
         if task and not prefer_water:
             task_node = task.get("nodeId", "")
-            if task_node in WATER_ROUTE_NODES or (task.get("routeBucket") or "ROAD") == "WATER":
+            if _is_water_task_location(task_node, task, map_gameplay):
                 logger.info(
-                    "Round %d: Skip water task %s at %s (waterScore<%d or no ICE_BOX)",
-                    round_num, task.get("taskId", ""), task_node, WATER_ROUTE_TASK_MIN,
+                    "Round %d: Skip water task %s at %s (waterScore<%d)",
+                    round_num, task.get("taskId", ""), task_node, _water_task_min(map_gameplay),
                 )
                 task = None
 
@@ -2764,7 +2905,8 @@ def _handle_tasks(
                 )
                 continue
             if not prefer_water and (
-                task_node in WATER_ROUTE_NODES or (task.get("routeBucket") or "ROAD") == "WATER"
+                task_node in _map_ctx(map_gameplay).water_route_nodes
+                or (task.get("routeBucket") or "ROAD") == "WATER"
             ):
                 continue
             # Score per round priority (策略文档 §5.1)
@@ -2851,18 +2993,109 @@ def _should_defer_ice_box(
     return False
 
 
+def _should_use_ice_box(
+    player: dict,
+    map_gameplay: MapGameplayContext | None,
+    phase: str = "",
+    force_delivery: bool = False,
+    graph: MapGraph | None = None,
+    current_node_id: str | None = None,
+    weather: dict | None = None,
+    gate_node_id: str = "",
+) -> tuple[bool, str]:
+    """Decide whether to consume ICE_BOX this frame."""
+    if not has_resource(player, "ICE_BOX"):
+        return False, ""
+    freshness = get_freshness(player)
+    threshold = _ice_threshold(map_gameplay)
+    rush_threshold = _ice_rush_threshold(map_gameplay)
+
+    if force_delivery and freshness < rush_threshold:
+        return True, "force-delivery"
+
+    if phase == "RUSH" and freshness < rush_threshold:
+        return True, "rush-consume"
+
+    if graph and current_node_id and gate_node_id:
+        hops = graph.path_length(current_node_id, gate_node_id, weather, None)
+        if hops <= FINAL_CORRIDOR_GATE_HOPS and freshness < rush_threshold:
+            return True, "near-gate"
+
+    if graph and current_node_id and weather:
+        penalized = _get_weather_penalized_routes(weather)
+        if "MOUNTAIN" in penalized and freshness < threshold + 2:
+            next_step = graph.next_step_toward(
+                current_node_id, gate_node_id, weather, None, use_weighted=True,
+            ) if gate_node_id else None
+            if next_step and graph.get_edge_route_type(current_node_id, next_step) == "MOUNTAIN":
+                return True, "hot-mountain-ahead"
+
+    if freshness < threshold:
+        return True, "below-threshold"
+    return False, ""
+
+
 def _try_use_ice_box(
     match_id: str, round_num: int, player_id: int, player: dict,
+    map_gameplay: MapGameplayContext | None = None,
+    phase: str = "",
+    force_delivery: bool = False,
+    graph: MapGraph | None = None,
+    current_node_id: str | None = None,
+    weather: dict | None = None,
+    gate_node_id: str = "",
 ) -> dict | None:
-    """鲜度 < 90 时立即使用冰鉴（须在节点 IDLE 且非交设卡税状态）。"""
-    if not has_resource(player, "ICE_BOX"):
+    """鲜度低于阈值、或冲刺/交付前兜底时使用冰鉴。"""
+    should, reason = _should_use_ice_box(
+        player, map_gameplay, phase, force_delivery,
+        graph, current_node_id, weather, gate_node_id,
+    )
+    if not should:
         return None
     freshness = get_freshness(player)
-    if freshness >= ICE_BOX_FRESHNESS_THRESHOLD:
-        return None
-    logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
+    logger.info(
+        "Round %d: Using ICE_BOX (freshness=%.1f, reason=%s)",
+        round_num, freshness, reason,
+    )
     return make_action(match_id, round_num, player_id, [
         make_use_resource_action("ICE_BOX")
+    ])
+
+
+def _try_use_intel(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    weather: dict | None,
+    map_gameplay: MapGameplayContext | None,
+    visited_node_ids: set[str] | None,
+) -> dict | None:
+    """Mark unexplored obstacle candidates within route distance."""
+    if not has_resource(player, "INTEL"):
+        return None
+    prof = _profile(map_gameplay)
+    if not prof.intel_enabled:
+        return None
+    ctx = _map_ctx(map_gameplay)
+    visited = visited_node_ids or set()
+    candidates = list(ctx.obstacle_candidate_node_ids) or list(ctx.intel_nodes)
+    best_target = ""
+    best_dist = float("inf")
+    for nid in candidates:
+        if nid == current_node_id or nid in visited:
+            continue
+        dist = graph.min_route_distance(current_node_id, nid, weather, None)
+        if dist <= INTEL_MAX_DISTANCE and dist < best_dist:
+            best_dist = dist
+            best_target = nid
+    if not best_target:
+        return None
+    logger.info("Round %d: Using INTEL on %s (routeDist=%.1f)", round_num, best_target, best_dist)
+    return make_action(match_id, round_num, player_id, [
+        make_use_resource_action("INTEL", best_target)
     ])
 
 
@@ -2889,6 +3122,7 @@ def _handle_resources(
     current_node: dict | None, phase: str, weather: dict | None,
     gate_node_id: str = "",
     process_nodes: dict[str, dict] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict | None:
     """Handle resource claiming strategy (策略文档 §6).
 
@@ -2901,10 +3135,13 @@ def _handle_resources(
     if round_num >= 520:
         return None
 
+    ctx = _map_ctx(map_gameplay)
+    prof = _profile(map_gameplay)
     hops_to_gate = _hops_to_gate(graph, current_node_id, gate_node_id, weather, None)
-    near_gate = hops_to_gate <= NEAR_GATE_RESOURCE_HOPS
+    near_gate = hops_to_gate <= prof.near_gate_skip_permit_hops
     on_final_approach = hops_to_gate <= FINAL_CORRIDOR_GATE_HOPS
     at_palace_transfer = _is_palace_transfer_node(process_nodes, current_node_id)
+    in_gate_corridor = current_node_id in GATE_CORRIDOR_NODES
 
     resources = find_available_resources(current_node)
     if not resources:
@@ -2912,23 +3149,35 @@ def _handle_resources(
 
     my_resources = get_player_resources(player)
 
-    # Filter to only high-value resources worth claiming
     HIGH_VALUE_RESOURCES = {"FAST_HORSE", "SHORT_HORSE", "ICE_BOX"}
     WINDOW_RESOURCES = {"OFFICIAL_PERMIT", "PASS_TOKEN"}
 
     for rtype, count in resources:
-        # Skip if already have this resource
         if my_resources.get(rtype, 0) >= 1 and rtype in HIGH_VALUE_RESOURCES:
             continue
-        # Only claim high-value resources (FAST_HORSE, SHORT_HORSE, ICE_BOX)
         if rtype in HIGH_VALUE_RESOURCES:
             logger.info("Round %d: Claiming resource %s at %s", round_num, rtype, current_node_id)
             return make_action(match_id, round_num, player_id, [
                 make_claim_resource_action(current_node_id, rtype)
             ])
-        # Claim OFFICIAL_PERMIT/PASS_TOKEN for window contests
+        if rtype == "INTEL" and prof.intel_enabled:
+            if get_task_score(player) >= TASK_SCORE_TARGET or near_gate:
+                continue
+            if my_resources.get("INTEL", 0) >= 1:
+                continue
+            logger.info("Round %d: Claiming INTEL at %s", round_num, current_node_id)
+            return make_action(match_id, round_num, player_id, [
+                make_claim_resource_action(current_node_id, rtype)
+            ])
         if rtype in WINDOW_RESOURCES:
-            if near_gate:
+            # 变种地图过所/官凭可能在 S07 等中段节点，仅入关走廊才跳过
+            if near_gate and in_gate_corridor:
+                continue
+            if (
+                near_gate
+                and rtype == "PASS_TOKEN"
+                and current_node_id not in ctx.pass_token_nodes
+            ):
                 continue
             total_permits = (
                 my_resources.get("OFFICIAL_PERMIT", 0)
@@ -2958,13 +3207,11 @@ def _handle_resources(
                     make_claim_resource_action(current_node_id, rtype)
                 ])
             continue
-        # Claim BOAT_RIGHT (策略文档 §6.1: 仅领取, passive)
         if rtype == "BOAT_RIGHT" and my_resources.get("BOAT_RIGHT", 0) < 1:
             logger.info("Round %d: Claiming BOAT_RIGHT at %s", round_num, current_node_id)
             return make_action(match_id, round_num, player_id, [
                 make_claim_resource_action(current_node_id, rtype)
             ])
-        # Skip INTEL — low value, not worth the frames early game
 
     return None
 
@@ -3017,12 +3264,23 @@ def _handle_use_resources(
     terminal_node_ids: list[str] | None = None,
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
+    inquire_nodes: list[dict] | None = None,
+    visited_node_ids: set[str] | None = None,
 ) -> dict | None:
-    """Handle using resources: horses (冰鉴由 _try_use_ice_box 优先处理)."""
+    """Handle using resources: horses, intel (冰鉴由 _try_use_ice_box 优先处理)."""
+    intel_action = _try_use_intel(
+        match_id, round_num, player_id, player, graph,
+        current_node_id, weather, map_gameplay, visited_node_ids,
+    )
+    if intel_action is not None:
+        return intel_action
+
     force_delivery = _should_force_delivery(
         round_num, phase, player, graph, current_node_id,
         gate_node_id, terminal_node_ids, weather,
         process_nodes, processed_node_ids,
+        map_gameplay=map_gameplay,
     )
 
     if force_delivery:
@@ -3096,6 +3354,7 @@ def _score_squad_clear_target(
     node_id: str,
     my_path: list[str],
     opp_path: list[str],
+    obstacle_candidate_node_ids: frozenset[str] | None = None,
 ) -> float:
     """Higher score = more valuable to clear (own route, opponent tax, shared choke)."""
     if node_id in GATE_CORRIDOR_NODES:
@@ -3111,6 +3370,8 @@ def _score_squad_clear_target(
         score += 4.0
     elif on_opp_path and not on_my_path:
         score += 3.0
+    if obstacle_candidate_node_ids and node_id in obstacle_candidate_node_ids and on_my_path:
+        score += 6.0
     return score
 
 
@@ -3127,11 +3388,13 @@ def _find_squad_clear_target(
     my_task_score: int,
     squad_count: int,
     squad_clear_pending: set[str],
+    map_gameplay: MapGameplayContext | None = None,
 ) -> str | None:
     """Pick obstacle node for SQUAD_CLEAR: own route first, then opponent tax routes."""
     if squad_count < GATE_CORRIDOR_SQUAD_MIN:
         return None
 
+    ctx = _map_ctx(map_gameplay)
     my_path = _path_nodes_to_goal(
         graph, current_node_id, goal_node_id, weather, obstacle_nodes,
     )
@@ -3154,7 +3417,9 @@ def _find_squad_clear_target(
         if nid not in GATE_CORRIDOR_NODES and _node_has_planned_t04(tasks, nid, failed_task_ids, my_task_score):
             continue
 
-        score = _score_squad_clear_target(nid, my_path, opp_path)
+        score = _score_squad_clear_target(
+            nid, my_path, opp_path, ctx.obstacle_candidate_node_ids,
+        )
         if nid in GATE_CORRIDOR_NODES:
             min_squad = GATE_CORRIDOR_SQUAD_MIN
         else:
@@ -3419,6 +3684,7 @@ def _should_set_guard_dynamic(
     phase: str,
     process_nodes: dict[str, dict] | None = None,
     force_delivery: bool = False,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> tuple[bool, str]:
     """Decide whether to SET_GUARD at the fleet's current node."""
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
@@ -3429,6 +3695,9 @@ def _should_set_guard_dynamic(
         return False, "force-delivery"
 
     task_score = get_task_score(player)
+    guard_min = _profile(map_gameplay).guard_min_task_score
+    if task_score < guard_min and mode != "GATE_FIGHT":
+        return False, f"task<{guard_min}"
     hops_to_gate = float("inf")
     if graph and gate_node_id:
         hops_to_gate = graph.path_length(current_node_id, gate_node_id, weather, obstacle_nodes)
@@ -3523,6 +3792,7 @@ def _try_set_guard_action(
     opp_player: dict | None, mode: str, phase: str,
     process_nodes: dict[str, dict] | None = None,
     force_delivery: bool = False,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict | None:
     should, reason = _should_set_guard_dynamic(
         graph, current_node_id, gate_node_id, terminal_node_ids,
@@ -3530,6 +3800,7 @@ def _try_set_guard_action(
         my_team_id, player_id, opp_player, mode, phase,
         process_nodes=process_nodes,
         force_delivery=force_delivery,
+        map_gameplay=map_gameplay,
     )
     if not should:
         return None
@@ -3557,6 +3828,7 @@ def _handle_combat(
     tasks: list[dict] | None = None,
     failed_task_ids: set[str] | None = None,
     squad_clear_pending: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict | None:
     """Handle combat: guard, break, squad (策略文档 §8)."""
     if obstacle_nodes is None:
@@ -3581,34 +3853,45 @@ def _handle_combat(
         if optimal_path and len(optimal_path) >= 2:
             next_hop = optimal_path[1]
             if next_hop in blocked:
+                reroute_blocked = set(blocked) | set(obstacle_nodes)
+                reroute_blocked.discard(goal)
+                alt_step = graph.next_step_toward(
+                    current_node_id, goal, weather, reroute_blocked,
+                    use_weighted=True, process_nodes=process_nodes,
+                )
+                if alt_step and alt_step not in blocked:
+                    logger.info(
+                        "Round %d: Reroute via %s to avoid blocked %s",
+                        round_num, alt_step, next_hop,
+                    )
+                    return make_action(match_id, round_num, player_id, [make_move_action(alt_step)])
                 for node in inquire_nodes:
-                    if node.get("nodeId") == next_hop:
-                        guard = node.get("guard", {})
-                        if is_enemy_guard(guard, my_team_id, player_id):
-                            good = min(get_good_fruit(player), 2)
-                            bad = min(get_bad_fruit(player), 2)
-                            if good + bad > 0:
-                                action = make_break_guard_action(next_hop, good_fruit=good, bad_fruit=bad)
-                                # Bind BREAK_ORDER if in RUSH and have resources (策略文档 §10: +3攻坚)
-                                if phase == "RUSH" and (bad >= 2 or good >= 1):
-                                    action["rushTactic"] = "BREAK_ORDER"
-                                    logger.info("Round %d: Breaking guard at %s with BREAK_ORDER", round_num, next_hop)
-                                else:
-                                    logger.info("Round %d: Breaking guard at %s (blocking path)", round_num, next_hop)
-                                return make_action(match_id, round_num, player_id, [action])
-                        # Try FORCED_PASS instead
-                        logger.info("Round %d: Forced pass at %s", round_num, next_hop)
-                        return make_action(match_id, round_num, player_id, [
-                            make_forced_pass_action(next_hop)
-                        ])
+                    if node.get("nodeId") != next_hop:
+                        continue
+                    guard = node.get("guard", {})
+                    if is_enemy_guard(guard, my_team_id, player_id):
+                        good = min(get_good_fruit(player), 2)
+                        bad = min(get_bad_fruit(player), 2)
+                        if good + bad > 0:
+                            action = make_break_guard_action(next_hop, good_fruit=good, bad_fruit=bad)
+                            if phase == "RUSH" and (bad >= 2 or good >= 1):
+                                action["rushTactic"] = "BREAK_ORDER"
+                                logger.info("Round %d: Breaking guard at %s with BREAK_ORDER", round_num, next_hop)
+                            else:
+                                logger.info("Round %d: Breaking guard at %s (blocking path)", round_num, next_hop)
+                            return make_action(match_id, round_num, player_id, [action])
+                    logger.info("Round %d: Forced pass at %s", round_num, next_hop)
+                    return make_action(match_id, round_num, player_id, [
+                        make_forced_pass_action(next_hop)
+                    ])
 
     # --- Squad actions (策略文档 §8.4) — only if not RUSH ---
     if phase != "RUSH":
         squad_count = get_squad_count(player)
         my_task_score = get_task_score(player)
+        scout_min = _profile(map_gameplay).squad_scout_min_squad
 
-        # Reserve squads for late key-pass guard weakening; scouting is optional.
-        if squad_count >= 10 and my_task_score < TASK_SCORE_TARGET and process_nodes:
+        if squad_count >= scout_min and my_task_score < TASK_SCORE_TARGET and process_nodes:
             for nid, info in process_nodes.items():
                 if nid not in visited_node_ids and nid != current_node_id:
                     dist = graph.path_length(current_node_id, nid, weather, None)
@@ -3623,7 +3906,7 @@ def _handle_combat(
             clear_target = _find_squad_clear_target(
                 graph, current_node_id, goal, inquire_nodes, obstacle_nodes,
                 weather, opp_player, tasks, failed_task_ids, my_task_score,
-                squad_count, squad_clear_pending,
+                squad_count, squad_clear_pending, map_gameplay,
             )
             if clear_target:
                 on_my = clear_target in _path_nodes_to_goal(
@@ -3735,6 +4018,7 @@ def _handle_rush_tactics(
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
     rush_speed_failed: bool = False,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict | None:
     """Handle rush tactics: RUSH_SPEED, RUSH_PROTECT (策略文档 §10).
 
@@ -3744,17 +4028,37 @@ def _handle_rush_tactics(
     if phase != "RUSH":
         return None
 
-    # RUSH_SPEED can only be used when IDLE
     state = player.get("state", "")
     if state != "IDLE":
         return None
 
     freshness = get_freshness(player)
 
-    # RUSH_PROTECT: 鲜度<50, 停靠节点使用 (策略文档 §10: 0成本)
     if freshness < RUSH_PROTECT_FRESHNESS:
         logger.info("Round %d: Using RUSH_PROTECT (freshness=%.1f)", round_num, freshness)
         return make_action(match_id, round_num, player_id, [make_rush_protect_action()])
 
-    # The current server rejects standalone RUSH_SPEED as INVALID_ACTION_TYPE.
+    if rush_speed_failed or _has_move_speed_buff(player):
+        return None
+
+    if graph and gate_node_id and current_node_id:
+        next_step = graph.next_step_toward(
+            current_node_id, gate_node_id, weather, obstacle_nodes,
+            use_weighted=True, process_nodes=process_nodes,
+        )
+        if next_step:
+            hop_cost = graph.edge_cost(
+                current_node_id, next_step, weather, obstacle_nodes, process_nodes,
+            )
+            if hop_cost >= HORSE_USE_MIN_HOP_COST:
+                logger.info(
+                    "Round %d: Using RUSH_SPEED before expensive hop (cost=%.1f)",
+                    round_num, hop_cost,
+                )
+                return make_action(match_id, round_num, player_id, [make_rush_speed_action()])
+
+    if freshness >= _ice_threshold(map_gameplay):
+        logger.info("Round %d: Using RUSH_SPEED (freshness=%.1f)", round_num, freshness)
+        return make_action(match_id, round_num, player_id, [make_rush_speed_action()])
+
     return None

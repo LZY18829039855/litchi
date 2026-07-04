@@ -10,6 +10,7 @@ from typing import Any
 from lychee_client.transport import encode_frame, read_frames_from_buffer
 from lychee_client.messages import parse_message, StartMessage, InquireMessage, OverMessage
 from lychee_client.map_graph import MapGraph
+from lychee_client.map_gameplay import MapGameplayContext, build_map_gameplay, default_map_gameplay
 from lychee_client.state import can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS, get_enemy_busy_task_ids
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
@@ -30,6 +31,7 @@ class GameClient:
         self.match_id = ""
         self.graph: MapGraph | None = None
         self.start_msg: StartMessage | None = None
+        self.map_gameplay: MapGameplayContext = default_map_gameplay()
         self.process_nodes: dict[str, dict] = {}  # nodeId -> {processType, processRound}
         self.active_contest_id: str = ""  # cached contestId from WINDOW_CONTEST_START
         self.round_count = 0
@@ -142,8 +144,23 @@ class GameClient:
                     "processRound": pn.get("processRound", 0),
                 }
 
-        logger.info("Received start: matchId=%s, %d nodes, %d edges, %d process nodes",
-                     start.match_id, len(start.nodes), len(start.edges), len(self.process_nodes))
+        self.map_gameplay = build_map_gameplay(start.raw, self.graph)
+        ctx = self.map_gameplay
+        logger.info(
+            "Received start: matchId=%s, %d nodes, %d edges, %d process nodes, "
+            "map_kind=%s map_id=%s water=%s official_mid=%s obstacles=%s "
+            "profile={ice=%.0f water_min=%d scout_min=%d force_buf=%.0f guard_min=%d}",
+            start.match_id, len(start.nodes), len(start.edges), len(self.process_nodes),
+            ctx.map_kind.value, ctx.map_id or "?",
+            sorted(ctx.water_route_nodes),
+            sorted(ctx.official_mid_route_nodes),
+            sorted(ctx.obstacle_candidate_node_ids),
+            ctx.profile.ice_box_freshness_threshold,
+            ctx.profile.water_route_task_min,
+            ctx.profile.squad_scout_min_squad,
+            ctx.profile.force_delivery_slack_buffer,
+            ctx.profile.guard_min_task_score,
+        )
 
     def send_ready(self) -> None:
         """Send ready message."""
@@ -551,6 +568,7 @@ class GameClient:
             guard_stuck_rounds=self.guard_stuck_rounds,
             guard_stuck_target=self.guard_stuck_target,
             own_guard_sites=self.own_guard_sites,
+            map_gameplay=self.map_gameplay,
         )
 
         self.send_message(action_msg)

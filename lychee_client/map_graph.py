@@ -147,22 +147,30 @@ class MapGraph:
         # Cost in frame units: distance * routeCostFactor / 1000
         base_cost = distance * base_factor / 1000
 
-        # 仅当前生效天气影响移动耗时（任务书 §2.5；预告天气不参与寻路）
         if weather:
-            for fw in weather.get("active", []):
-                weather_type = fw.get("type", "")
-                region = fw.get("region", "")
-                rates = WEATHER_PASSAGE_RATE.get(weather_type, {})
-                if not rates:
-                    continue
-                rate = rates.get(route_type)
-                if rate is None:
-                    if region == "WATER" and route_type == "WATER":
-                        rate = rates.get("WATER")
-                    elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
-                        rate = rates.get("MOUNTAIN")
-                if rate and rate > 0:
-                    base_cost *= rate / 1000.0
+            for fw_list, is_forecast in (
+                (weather.get("active", []) or [], False),
+                (weather.get("forecast", []) or [], True),
+            ):
+                for fw in fw_list:
+                    weather_type = fw.get("type", "")
+                    region = fw.get("region", "")
+                    rates = WEATHER_PASSAGE_RATE.get(weather_type, {})
+                    if not rates:
+                        if is_forecast and weather_type == "HOT" and route_type == "MOUNTAIN":
+                            base_cost *= 1.08
+                        continue
+                    rate = rates.get(route_type)
+                    if rate is None:
+                        if region == "WATER" and route_type == "WATER":
+                            rate = rates.get("WATER")
+                        elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
+                            rate = rates.get("MOUNTAIN")
+                    if rate and rate > 0:
+                        factor = rate / 1000.0
+                        if is_forecast:
+                            factor = 1.0 + (factor - 1.0) * 0.55
+                        base_cost *= factor
 
         # Add process cost penalty for the target node
         if process_nodes and to_id in process_nodes:
@@ -278,3 +286,20 @@ class MapGraph:
         """Return the number of hops in the shortest path, or infinity if unreachable."""
         path = self.shortest_path(from_id, to_id, weather, blocked_nodes)
         return len(path) - 1 if path else float('inf')
+
+    def min_route_distance(
+        self,
+        from_id: str,
+        to_id: str,
+        weather: dict | None = None,
+        blocked_nodes: set[str] | None = None,
+    ) -> float:
+        """Minimum cumulative edge distance along the weighted shortest path."""
+        path = self.weighted_shortest_path(from_id, to_id, weather, blocked_nodes, None)
+        if not path:
+            return float("inf")
+        total = 0.0
+        for i in range(len(path) - 1):
+            edge = self.get_edge(path[i], path[i + 1])
+            total += edge.get("distance", 30) if edge else 30.0
+        return total
