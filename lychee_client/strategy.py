@@ -19,7 +19,7 @@ from lychee_client.state import (
     can_move, can_act, get_current_node_id, needs_processing,
     is_delivered, is_retired, is_verified, is_at_node, is_in_passive_state,
     is_in_limited_state,
-    find_available_resources, find_task_at_node,
+    find_available_resources, find_task_at_node, get_enemy_busy_task_ids,
     get_good_fruit, get_bad_fruit, get_freshness,
     get_player_resources, has_resource, get_squad_count,
     get_action_points, get_task_score, get_blocked_nodes,
@@ -241,6 +241,7 @@ def _decide_action_impl(
     route_blocked.update(guard_blocked_targets)
     route_blocked.update(avoid_route_nodes)
     opp_player = _find_opponent(all_players, player_id)
+    enemy_busy_task_ids = get_enemy_busy_task_ids(all_players, player_id)
     mode = classify_opponent_mode(player, opp_player, phase)
 
     obstacle_nodes: set[str] = set()
@@ -315,12 +316,14 @@ def _decide_action_impl(
                         match_id, round_num, player_id, player, graph,
                         current_node_id, tasks, failed_task_ids,
                         preferred_task_id=pending_task_hold_task_id,
+                        enemy_busy_task_ids=enemy_busy_task_ids,
                     )
                     if task_retry is not None:
                         return task_retry
                 task_retry = _retry_task_at_current_node(
                     match_id, round_num, player_id, player, graph,
                     current_node_id, tasks, failed_task_ids,
+                    enemy_busy_task_ids=enemy_busy_task_ids,
                 )
                 if task_retry is not None:
                     return task_retry
@@ -414,6 +417,7 @@ def _decide_action_impl(
             match_id, round_num, player_id, player, graph,
             current_node_id, tasks, failed_task_ids,
             preferred_task_id=pending_task_hold_task_id,
+            enemy_busy_task_ids=enemy_busy_task_ids,
         )
         if task_retry is not None:
             return task_retry
@@ -523,6 +527,7 @@ def _decide_action_impl(
             obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
             processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
             failed_task_ids=failed_task_ids,
+            enemy_busy_task_ids=enemy_busy_task_ids,
         )
         if task_action is not None:
             return task_action
@@ -631,10 +636,16 @@ def _decide_action_impl(
                 t04_task = task
                 break
         if t04_task:
-            logger.info("Round %d: Obstacle at %s, claiming T04 task", round_num, move_target)
-            return make_action(match_id, round_num, player_id, [
-                make_claim_task_action(t04_task.get("taskId", ""))
-            ])
+            t04_id = t04_task.get("taskId", "")
+            if t04_id not in enemy_busy_task_ids:
+                logger.info("Round %d: Obstacle at %s, claiming T04 task", round_num, move_target)
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_task_action(t04_id)
+                ])
+            logger.info(
+                "Round %d: Skip T04 at %s, enemy processing task %s",
+                round_num, move_target, t04_id,
+            )
 
         # Priority 2: CLEAR if we have good fruit to spare (策略文档 §3.4: 1好果6帧)
         good_fruit = get_good_fruit(player)
@@ -1843,7 +1854,10 @@ def _retry_task_at_current_node(
     tasks: list[dict],
     failed_task_ids: set[str],
     preferred_task_id: str = "",
+    enemy_busy_task_ids: set[str] | None = None,
 ) -> dict | None:
+    if enemy_busy_task_ids is None:
+        enemy_busy_task_ids = set()
     if get_task_score(player) >= TASK_SCORE_TARGET:
         return None
     if isinstance(player.get("currentProcess"), dict):
@@ -1865,6 +1879,7 @@ def _retry_task_at_current_node(
         task = find_task_at_node(
             tasks, current_node_id, player_id,
             graph_neighbors=neighbors,
+            enemy_busy_task_ids=enemy_busy_task_ids,
         )
     if not task:
         return None
@@ -1878,7 +1893,7 @@ def _retry_task_at_current_node(
         return None
 
     task_id = task.get("taskId", "")
-    if not task_id or task_id in failed_task_ids:
+    if not task_id or task_id in failed_task_ids or task_id in enemy_busy_task_ids:
         return None
     template_id = get_task_template_id(task)
     if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
@@ -1903,6 +1918,7 @@ def _handle_tasks(
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
     failed_task_ids: set[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
 ) -> dict | None:
     """Handle task claiming strategy (策略文档 §5).
 
@@ -1918,6 +1934,8 @@ def _handle_tasks(
         visited_node_ids = set()
     if failed_task_ids is None:
         failed_task_ids = set()
+    if enemy_busy_task_ids is None:
+        enemy_busy_task_ids = set()
 
     my_task_score = get_task_score(player)
     if _should_force_delivery(
@@ -1949,6 +1967,7 @@ def _handle_tasks(
     task = find_task_at_node(
         tasks, current_node_id, my_player_id,
         graph_neighbors=graph.get_neighbors(current_node_id) if graph else None,
+        enemy_busy_task_ids=enemy_busy_task_ids,
     )
     if task:
         template_id = get_task_template_id(task)
@@ -1994,6 +2013,8 @@ def _handle_tasks(
                 continue
             task_node = task.get("nodeId", "")
             if not task_node:
+                continue
+            if task.get("taskId", "") in enemy_busy_task_ids:
                 continue
 
             # T06: skip if no horse

@@ -202,7 +202,41 @@ def find_available_resources(node: dict | None) -> list[tuple[str, int]]:
     return available
 
 
-def _task_is_claimable(task: dict, node_id: str, player_id: int, graph_neighbors: list[str] | None = None) -> bool:
+def task_id_from_current_process(process: dict | None) -> str:
+    """Extract task instance id from a player's currentProcess, if processing a task."""
+    if not isinstance(process, dict):
+        return ""
+    if process.get("action") == "CLAIM_TASK" or process.get("type") == "CLAIM_TASK":
+        task_id = process.get("taskId", "")
+        if task_id:
+            return task_id
+    object_key = process.get("objectKey", "")
+    if object_key.startswith("TASK:"):
+        return object_key[5:]
+    return ""
+
+
+def get_enemy_busy_task_ids(all_players: list[dict] | None, my_player_id: int) -> set[str]:
+    """Task ids currently being processed by opponents (currentProcess lock)."""
+    busy: set[str] = set()
+    if not all_players:
+        return busy
+    for player in all_players:
+        if player.get("playerId") == my_player_id:
+            continue
+        task_id = task_id_from_current_process(player.get("currentProcess"))
+        if task_id:
+            busy.add(task_id)
+    return busy
+
+
+def _task_is_claimable(
+    task: dict,
+    node_id: str,
+    player_id: int,
+    graph_neighbors: list[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
+) -> bool:
     task_node = task.get("nodeId", "")
     template_id = get_task_template_id(task)
     if template_id.startswith("T04"):
@@ -212,6 +246,10 @@ def _task_is_claimable(task: dict, node_id: str, player_id: int, graph_neighbors
         return False
 
     if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
+        return False
+
+    task_id = task.get("taskId", "")
+    if enemy_busy_task_ids and task_id in enemy_busy_task_ids:
         return False
 
     protection = task.get("protectionPlayerId", 0)
@@ -227,10 +265,11 @@ def find_task_at_node(
     node_id: str,
     player_id: int,
     graph_neighbors: list[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
 ) -> dict | None:
     candidates = []
     for task in tasks:
-        if _task_is_claimable(task, node_id, player_id, graph_neighbors):
+        if _task_is_claimable(task, node_id, player_id, graph_neighbors, enemy_busy_task_ids):
             candidates.append(task)
 
     if not candidates:
