@@ -212,7 +212,6 @@ class GameClient:
                 )
                 if not is_enemy_active:
                     self.guard_blocked_targets.discard(nid)
-                    self.avoid_route_nodes.discard(nid)
                     logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
                 elif current_node_id and self.graph and nid in self.graph.get_neighbors(current_node_id):
                     self.guard_blocked_targets.add(nid)
@@ -298,6 +297,14 @@ class GameClient:
                         if target:
                             self.guard_blocked_targets.add(target)
                             logger.info("Round %d: Guard blocks %s, will reroute/break", inquire.round, target)
+                    if last_error == "MOVING_ACTION_FORBIDDEN":
+                        target = ar.get("targetNodeId") or player.get("nextNodeId", "")
+                        if target:
+                            self.guard_blocked_targets.add(target)
+                            logger.info(
+                                "Round %d: MOVING_ACTION_FORBIDDEN at %s, guard tax in progress",
+                                inquire.round, target,
+                            )
 
         # Sync squad clear pending with live obstacle state
         for node in inquire.nodes:
@@ -361,11 +368,18 @@ class GameClient:
                     target = payload.get("targetNodeId") or player.get("nextNodeId", "")
                     if target:
                         self.guard_blocked_targets.add(target)
+                if last_error == "MOVING_ACTION_FORBIDDEN":
+                    target = payload.get("targetNodeId") or player.get("nextNodeId", "")
+                    if target:
+                        self.guard_blocked_targets.add(target)
+                        logger.info(
+                            "Round %d: MOVING_ACTION_FORBIDDEN at %s (from event), guard tax in progress",
+                            inquire.round, target,
+                        )
             if ev_type == "GUARD_BREAK":
                 node_id = payload.get("nodeId") or payload.get("targetNodeId", "")
                 if node_id:
                     self.guard_blocked_targets.discard(node_id)
-                    self.avoid_route_nodes.discard(node_id)
                     self.forced_pass_failed_targets.discard(node_id)
                     logger.info("Round %d: Guard broken at %s", inquire.round, node_id)
                     if payload.get("ownerTeamId") == player.get("teamId", "") or payload.get("playerId") == self.player_id:
@@ -378,7 +392,6 @@ class GameClient:
                 node_id = payload.get("nodeId", "")
                 if node_id and payload.get("defense", 1) <= 0:
                     self.guard_blocked_targets.discard(node_id)
-                    self.avoid_route_nodes.discard(node_id)
                     self.forced_pass_failed_targets.discard(node_id)
                     self.own_guard_sites.discard(node_id)
             if ev_type in ("PROCESS_COMPLETE", "VERIFY_GATE_COMPLETE"):
@@ -423,12 +436,13 @@ class GameClient:
                 self.guard_stuck_target = stuck_block
                 self.guard_stuck_rounds = 1
             if self.guard_stuck_rounds >= GUARD_STUCK_AVOID_ROUNDS:
+                if stuck_block not in self.avoid_route_nodes:
+                    logger.info(
+                        "Round %d: Permanently avoiding %s after %d stuck rounds",
+                        inquire.round, stuck_block, self.guard_stuck_rounds,
+                    )
                 self.avoid_route_nodes.add(stuck_block)
                 self.guard_blocked_targets.discard(stuck_block)
-                logger.info(
-                    "Round %d: Permanently avoiding %s after %d stuck rounds",
-                    inquire.round, stuck_block, self.guard_stuck_rounds,
-                )
         elif not stuck_block:
             self.guard_stuck_target = ""
             self.guard_stuck_rounds = 0

@@ -245,8 +245,13 @@ def _decide_action_impl(
 
     obstacle_nodes: set[str] = set()
     for node in inquire_nodes:
-        if node_has_obstacle(node):
-            obstacle_nodes.add(node.get("nodeId", ""))
+        nid = node.get("nodeId", "")
+        if not nid or not node_has_obstacle(node):
+            continue
+        guard = node.get("guard") if isinstance(node.get("guard"), dict) else {}
+        if is_enemy_guard(guard, my_team_id, player_id):
+            continue
+        obstacle_nodes.add(nid)
     force_delivery = _should_force_delivery(
         round_num, phase, player, graph, current_node_id,
         gate_node_id, terminal_node_ids, weather,
@@ -334,18 +339,10 @@ def _decide_action_impl(
                     return move_action
 
             if guard_target:
-                if force_delivery:
-                    blocker_action = _handle_force_delivery_blocker(
-                        match_id, round_num, player_id, player,
-                        guard_target, inquire_nodes, tasks, failed_task_ids,
-                        obstacle_nodes, my_team_id,
-                    )
-                    if blocker_action.get("msg_data", {}).get("actions"):
-                        return blocker_action
-                return _wait_and_weaken_guard(
-                    match_id, round_num, player_id, player,
-                    inquire_nodes, guard_target, my_team_id,
-                    **guard_wait_kwargs,
+                return _handle_limited_state_guard_block(
+                    match_id, round_num, player_id, player, state,
+                    guard_target, last_move_failed, last_move_error,
+                    inquire_nodes, my_team_id, guard_wait_kwargs,
                 )
 
             if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
@@ -354,18 +351,10 @@ def _decide_action_impl(
 
             if next_node:
                 if next_node in route_blocked:
-                    if force_delivery:
-                        blocker_action = _handle_force_delivery_blocker(
-                            match_id, round_num, player_id, player,
-                            next_node, inquire_nodes, tasks, failed_task_ids,
-                            obstacle_nodes, my_team_id,
-                        )
-                        if blocker_action.get("msg_data", {}).get("actions"):
-                            return blocker_action
-                    return _wait_and_weaken_guard(
-                        match_id, round_num, player_id, player,
-                        inquire_nodes, next_node, my_team_id,
-                        **guard_wait_kwargs,
+                    return _handle_limited_state_guard_block(
+                        match_id, round_num, player_id, player, state,
+                        next_node, last_move_failed, last_move_error,
+                        inquire_nodes, my_team_id, guard_wait_kwargs,
                     )
                 return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
             if current_node_id:
@@ -387,19 +376,12 @@ def _decide_action_impl(
         if state == "MOVING":
             if guard_target or last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
                 target = guard_target or player.get("nextNodeId", "")
-                if force_delivery and target:
-                    blocker_action = _handle_force_delivery_blocker(
-                        match_id, round_num, player_id, player,
-                        target, inquire_nodes, tasks, failed_task_ids,
-                        obstacle_nodes, my_team_id,
+                if target:
+                    return _handle_limited_state_guard_block(
+                        match_id, round_num, player_id, player, state,
+                        target, last_move_failed, last_move_error,
+                        inquire_nodes, my_team_id, guard_wait_kwargs,
                     )
-                    if blocker_action.get("msg_data", {}).get("actions"):
-                        return blocker_action
-                return _wait_and_weaken_guard(
-                    match_id, round_num, player_id, player,
-                    inquire_nodes, target, my_team_id,
-                    **guard_wait_kwargs,
-                )
             moving_action = _handle_moving(match_id, round_num, player_id, player, graph, weather, phase)
             if moving_action.get("msg_data", {}).get("actions"):
                 return moving_action
@@ -778,6 +760,70 @@ def _get_node_guard(inquire_nodes: list[dict], node_id: str) -> dict:
     return {}
 
 
+def _get_inquire_node(inquire_nodes: list[dict], node_id: str) -> dict | None:
+    for node in inquire_nodes:
+        if node.get("nodeId") == node_id:
+            return node
+    return None
+
+
+def _confirmed_obstacle(
+    inquire_nodes: list[dict],
+    node_id: str,
+    obstacle_nodes: set[str],
+) -> bool:
+    node = _get_inquire_node(inquire_nodes, node_id)
+    if node is not None:
+        return node_has_obstacle(node)
+    return node_id in obstacle_nodes
+
+
+def _is_paying_guard_travel_tax(
+    state: str,
+    player: dict,
+    last_move_error: str,
+    block_node: str,
+    route_blocked: set[str],
+) -> bool:
+    """WAITING/MOVING 交设卡时间税时只能 WAIT/EMPTY，不能 BREAK/CLEAR。"""
+    if last_move_error == "MOVING_ACTION_FORBIDDEN":
+        return True
+    if state != "WAITING":
+        return False
+    next_node = player.get("nextNodeId", "")
+    if next_node and next_node in route_blocked:
+        return True
+    return bool(block_node and block_node in route_blocked)
+
+
+def _handle_limited_state_guard_block(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    state: str,
+    block_node: str,
+    last_move_failed: bool,
+    last_move_error: str,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    guard_wait_kwargs: dict,
+) -> dict:
+    """Limited state handler: never BREAK/CLEAR while paying guard travel tax."""
+    route_blocked = guard_wait_kwargs.get("route_blocked") or set()
+    if _is_paying_guard_travel_tax(state, player, last_move_error, block_node, route_blocked):
+        logger.info(
+            "Round %d: %s paying guard tax at %s, WAIT only (no BREAK/CLEAR)",
+            round_num, state, block_node,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
+    return _wait_and_weaken_guard(
+        match_id, round_num, player_id, player,
+        inquire_nodes, block_node, my_team_id,
+        **guard_wait_kwargs,
+    )
+
+
 def _estimate_delivery_eta(
     graph: MapGraph,
     current_node_id: str,
@@ -1080,7 +1126,7 @@ def _plan_force_delivery_move(
             blocker_action = _handle_force_delivery_blocker(
                 match_id, round_num, player_id, player,
                 target, inquire_nodes, tasks, failed_task_ids,
-                obstacle_nodes, my_team_id,
+                obstacle_nodes, my_team_id, route_blocked,
             )
             if blocker_action.get("msg_data", {}).get("actions"):
                 return blocker_action
@@ -1117,7 +1163,11 @@ def _handle_force_delivery_blocker(
     failed_task_ids: set[str],
     obstacle_nodes: set[str],
     my_team_id: str,
+    route_blocked: set[str] | None = None,
 ) -> dict:
+    if route_blocked is None:
+        route_blocked = set()
+
     guard = _get_node_guard(inquire_nodes, target_node_id)
     if is_enemy_guard(guard, my_team_id, player_id):
         good = min(get_good_fruit(player), 2)
@@ -1130,6 +1180,18 @@ def _handle_force_delivery_blocker(
         return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
     if target_node_id in obstacle_nodes:
+        if not _confirmed_obstacle(inquire_nodes, target_node_id, obstacle_nodes):
+            logger.info(
+                "Round %d: FORCE_DELIVERY skip CLEAR at %s (no confirmed obstacle)",
+                round_num, target_node_id,
+            )
+            return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+        if guard_is_active(guard) and not is_own_guard(guard, my_team_id, player_id):
+            logger.info(
+                "Round %d: FORCE_DELIVERY skip CLEAR at %s (active guard, not obstacle)",
+                round_num, target_node_id,
+            )
+            return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
         t04_task = None
         for task in tasks:
             if (task.get("nodeId") == target_node_id
@@ -1181,11 +1243,14 @@ def _resolve_guarded_delivery_hop(
         return make_action(match_id, round_num, player_id, [make_wait_action()])
 
     if target_node_id in obstacle_nodes:
-        return _handle_force_delivery_blocker(
-            match_id, round_num, player_id, player,
-            target_node_id, inquire_nodes, tasks, failed_task_ids,
-            obstacle_nodes, my_team_id,
-        )
+        if is_enemy_guard(_get_node_guard(inquire_nodes, target_node_id), my_team_id, player_id):
+            pass
+        elif _confirmed_obstacle(inquire_nodes, target_node_id, obstacle_nodes):
+            return _handle_force_delivery_blocker(
+                match_id, round_num, player_id, player,
+                target_node_id, inquire_nodes, tasks, failed_task_ids,
+                obstacle_nodes, my_team_id, route_blocked,
+            )
 
     guard = _get_node_guard(inquire_nodes, target_node_id)
     guarded = (
@@ -1199,7 +1264,7 @@ def _resolve_guarded_delivery_hop(
         return _handle_force_delivery_blocker(
             match_id, round_num, player_id, player,
             target_node_id, inquire_nodes, tasks, failed_task_ids,
-            obstacle_nodes, my_team_id,
+            obstacle_nodes, my_team_id, route_blocked,
         )
 
     logger.info(
@@ -1640,7 +1705,8 @@ def _wait_and_weaken_guard(
 
     guard = _get_node_guard(inquire_nodes, target_node_id)
     if not is_enemy_guard(guard, my_team_id, player_id):
-        if force_delivery and graph and get_current_node_id(player):
+        player_state = player.get("state", "")
+        if player_state == "IDLE" and force_delivery and graph and get_current_node_id(player):
             detour = _find_delivery_detour_step(
                 graph, get_current_node_id(player), player, gate_node_id,
                 terminal_node_ids, weather, process_nodes, processed_node_ids,
@@ -1654,7 +1720,8 @@ def _wait_and_weaken_guard(
                 return make_action(match_id, round_num, player_id, [make_move_action(detour)])
 
     if (
-        force_delivery
+        player.get("state", "") == "IDLE"
+        and force_delivery
         and graph
         and _should_detour_force_delivery(
             target_node_id, route_blocked, avoid_route_nodes,
