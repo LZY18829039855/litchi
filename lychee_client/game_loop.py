@@ -10,7 +10,7 @@ from typing import Any
 from lychee_client.transport import encode_frame, read_frames_from_buffer
 from lychee_client.messages import parse_message, StartMessage, InquireMessage, OverMessage
 from lychee_client.map_graph import MapGraph
-from lychee_client.state import can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS
+from lychee_client.state import can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS, get_enemy_busy_task_ids
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
 
@@ -164,6 +164,18 @@ class GameClient:
 
         current_node_id = player.get("currentNodeId")
         current_node = inquire.find_node(current_node_id) if current_node_id else None
+        enemy_busy_task_ids = get_enemy_busy_task_ids(inquire.players, self.player_id)
+        if (
+            self.pending_task_hold_task_id
+            and self.pending_task_hold_task_id in enemy_busy_task_ids
+        ):
+            logger.info(
+                "Round %d: Clearing task hold for %s (enemy processing)",
+                inquire.round, self.pending_task_hold_task_id,
+            )
+            self.pending_task_hold_task_id = ""
+            self.pending_task_hold_node_id = ""
+            self.pending_task_hold_until_round = 0
 
         # Track node changes
         # When leaving a node, remove it from processed_node_ids (§4.1: revisit requires re-process)
@@ -267,14 +279,21 @@ class GameClient:
                             self.pending_task_hold_until_round = 0
                             logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
                     if ar.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
-                        self.pending_task_hold_task_id = self.last_claimed_task_id
-                        self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
-                        self.pending_task_hold_until_round = inquire.round + 6
-                        logger.info(
-                            "Round %d: Task %s busy at %s, holding until round %d",
-                            inquire.round, self.last_claimed_task_id,
-                            self.pending_task_hold_node_id, self.pending_task_hold_until_round,
-                        )
+                        failed_tid = self.last_claimed_task_id
+                        if failed_tid and failed_tid in enemy_busy_task_ids:
+                            logger.info(
+                                "Round %d: Task %s busy (enemy processing), skip hold",
+                                inquire.round, failed_tid,
+                            )
+                        else:
+                            self.pending_task_hold_task_id = self.last_claimed_task_id
+                            self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
+                            self.pending_task_hold_until_round = inquire.round + 6
+                            logger.info(
+                                "Round %d: Task %s busy at %s, holding until round %d",
+                                inquire.round, self.last_claimed_task_id,
+                                self.pending_task_hold_node_id, self.pending_task_hold_until_round,
+                            )
                     if last_error == "PROCESS_REQUIRED" and current_node_id:
                         self.processed_node_ids.discard(current_node_id)
                         logger.info("Round %d: PROCESS_REQUIRED at %s, clearing processed flag", inquire.round, current_node_id)
@@ -340,14 +359,21 @@ class GameClient:
                         self.pending_task_hold_until_round = 0
                         logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
                 if payload.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
-                    self.pending_task_hold_task_id = self.last_claimed_task_id
-                    self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
-                    self.pending_task_hold_until_round = inquire.round + 6
-                    logger.info(
-                        "Round %d: Task %s busy at %s (from event), holding until round %d",
-                        inquire.round, self.last_claimed_task_id,
-                        self.pending_task_hold_node_id, self.pending_task_hold_until_round,
-                    )
+                    failed_tid = self.last_claimed_task_id
+                    if failed_tid and failed_tid in enemy_busy_task_ids:
+                        logger.info(
+                            "Round %d: Task %s busy (enemy processing, from event), skip hold",
+                            inquire.round, failed_tid,
+                        )
+                    else:
+                        self.pending_task_hold_task_id = self.last_claimed_task_id
+                        self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
+                        self.pending_task_hold_until_round = inquire.round + 6
+                        logger.info(
+                            "Round %d: Task %s busy at %s (from event), holding until round %d",
+                            inquire.round, self.last_claimed_task_id,
+                            self.pending_task_hold_node_id, self.pending_task_hold_until_round,
+                        )
                 if last_error == "PROCESS_REQUIRED" and current_node_id:
                     self.processed_node_ids.discard(current_node_id)
                 if (
