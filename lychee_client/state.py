@@ -39,7 +39,13 @@ TASK_PRIORITY = {
 TASK_SCORE_TARGET = 90
 TASK_SCORE_STRETCH = 110
 MAX_TASK_DETOUR_COST = 15
-ICE_BOX_FRESHNESS_THRESHOLD = 72
+ICE_BOX_FRESHNESS_THRESHOLD = 82
+MAX_ROUND = 600
+SQUAD_CLEAR_COST = 2
+SQUAD_RESERVE_FOR_LATE = 4
+SQUAD_CLEAR_MIN_SQUAD = SQUAD_CLEAR_COST + SQUAD_RESERVE_FOR_LATE
+MAX_ACTIVE_GUARDS = 2
+GUARD_GOOD_FRUIT_RESERVE = 2
 RUSH_PROTECT_FRESHNESS = 50
 INTEL_MAX_DISTANCE = 15
 
@@ -78,6 +84,20 @@ def guard_is_active(guard: dict | None) -> bool:
     if guard.get("active") is False:
         return False
     return guard.get("defense", 0) > 0
+
+
+def is_own_guard(
+    guard: dict | None, my_team_id: str, my_player_id: int | None = None,
+) -> bool:
+    if not guard_is_active(guard):
+        return False
+    owner_team = (guard or {}).get("ownerTeamId")
+    if owner_team and my_team_id:
+        return owner_team == my_team_id
+    owner_player = (guard or {}).get("playerId")
+    if owner_player is not None and my_player_id is not None:
+        return owner_player == my_player_id
+    return False
 
 
 def is_verify_process(process_type: str | None) -> bool:

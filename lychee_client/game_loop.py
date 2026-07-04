@@ -49,6 +49,7 @@ class GameClient:
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
         self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
         self.forced_pass_failed_targets: set[str] = set()  # targets where blind forced pass was rejected this stop
+        self.squad_clear_pending: set[str] = set()  # obstacles already dispatched SQUAD_CLEAR
         self.last_forced_pass_target = ""
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
@@ -263,6 +264,7 @@ class GameClient:
                         "TARGET_NOT_REACHABLE",
                         "ACTION_REJECTED",
                         "FORCED_PASS_REPEAT",
+                        "OBJECT_BUSY",
                         }
                     ):
                         target = ar.get("targetNodeId", "") or self.last_forced_pass_target
@@ -274,6 +276,12 @@ class GameClient:
                         if target:
                             self.guard_blocked_targets.add(target)
                             logger.info("Round %d: Guard blocks %s, will reroute/break", inquire.round, target)
+
+        # Sync squad clear pending with live obstacle state
+        for node in inquire.nodes:
+            nid = node.get("nodeId", "")
+            if nid in self.squad_clear_pending and not node.get("hasObstacle", False):
+                self.squad_clear_pending.discard(nid)
 
         # Also check events for rejections and cache contest info
         for ev in inquire.events:
@@ -320,6 +328,7 @@ class GameClient:
                     "TARGET_NOT_REACHABLE",
                     "ACTION_REJECTED",
                     "FORCED_PASS_REPEAT",
+                    "OBJECT_BUSY",
                     }
                 ):
                     target = payload.get("targetNodeId", "") or self.last_forced_pass_target
@@ -335,12 +344,18 @@ class GameClient:
                 if node_id:
                     self.guard_blocked_targets.discard(node_id)
                     self.avoid_route_nodes.discard(node_id)
+                    self.forced_pass_failed_targets.discard(node_id)
                     logger.info("Round %d: Guard broken at %s", inquire.round, node_id)
+            if ev_type == "OBSTACLE_CLEAR":
+                node_id = payload.get("nodeId") or payload.get("targetNodeId", "")
+                if node_id:
+                    self.squad_clear_pending.discard(node_id)
             if ev_type == "GUARD_WEATHERING":
                 node_id = payload.get("nodeId", "")
                 if node_id and payload.get("defense", 1) <= 0:
                     self.guard_blocked_targets.discard(node_id)
                     self.avoid_route_nodes.discard(node_id)
+                    self.forced_pass_failed_targets.discard(node_id)
             if ev_type in ("PROCESS_COMPLETE", "VERIFY_GATE_COMPLETE"):
                 if payload.get("playerId") == self.player_id:
                     node_id = payload.get("nodeId") or payload.get("targetNodeId")
@@ -431,6 +446,7 @@ class GameClient:
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
             forced_pass_failed_targets=self.forced_pass_failed_targets,
+            squad_clear_pending=self.squad_clear_pending,
         )
 
         self.send_message(action_msg)
@@ -450,6 +466,11 @@ class GameClient:
             self.last_claimed_task_id = actions[0].get("taskId", "")
             self.last_claimed_task_node_id = current_node_id or ""
         self.last_forced_pass_target = actions[0].get("targetNodeId", "") if action_type == "FORCED_PASS" else ""
+        for action_item in actions:
+            if action_item.get("action") == "SQUAD_CLEAR":
+                target = action_item.get("targetNodeId", "")
+                if target:
+                    self.squad_clear_pending.add(target)
         if action_type == "MOVE":
             self.move_count += 1
         elif action_type in ("PROCESS", "DOCK", "VERIFY_GATE"):

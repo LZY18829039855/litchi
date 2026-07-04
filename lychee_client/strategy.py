@@ -24,10 +24,12 @@ from lychee_client.state import (
     get_player_resources, has_resource, get_squad_count,
     get_action_points, get_task_score, get_blocked_nodes,
     classify_opponent_mode, get_team_id, get_task_template_id,
-    is_verify_process, is_enemy_guard, guard_is_active, node_has_obstacle,
+    is_verify_process, is_enemy_guard, is_own_guard, guard_is_active, node_has_obstacle,
     TASK_SCORE_TARGET, TASK_SCORE_STRETCH, MAX_TASK_DETOUR_COST,
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
-    RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY,
+    RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY, MAX_ROUND,
+    SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
+    MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE,
 )
 from lychee_client.decision import (
     make_action, make_move_action, make_wait_action,
@@ -110,6 +112,7 @@ def decide_action(
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
+    squad_clear_pending: set[str] | None = None,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -139,6 +142,8 @@ def decide_action(
         avoid_route_nodes = set()
     if forced_pass_failed_targets is None:
         forced_pass_failed_targets = set()
+    if squad_clear_pending is None:
+        squad_clear_pending = set()
 
     try:
         return _decide_action_impl(
@@ -149,7 +154,7 @@ def decide_action(
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
-            forced_pass_failed_targets,
+            forced_pass_failed_targets, squad_clear_pending,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -186,6 +191,7 @@ def _decide_action_impl(
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
+    squad_clear_pending: set[str] | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -193,6 +199,8 @@ def _decide_action_impl(
         avoid_route_nodes = set()
     if forced_pass_failed_targets is None:
         forced_pass_failed_targets = set()
+    if squad_clear_pending is None:
+        squad_clear_pending = set()
 
     # --- P0: Stability ---
     if is_retired(player) or is_delivered(player):
@@ -226,7 +234,11 @@ def _decide_action_impl(
     for node in inquire_nodes:
         if node_has_obstacle(node):
             obstacle_nodes.add(node.get("nodeId", ""))
-    force_delivery = _should_force_delivery(round_num, phase, player)
+    force_delivery = _should_force_delivery(
+        round_num, phase, player, graph, current_node_id,
+        gate_node_id, terminal_node_ids, weather,
+        process_nodes, processed_node_ids,
+    )
 
     if is_in_limited_state(player):
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
@@ -286,23 +298,28 @@ def _decide_action_impl(
                 direct_target = _find_direct_delivery_step(
                     graph, current_node_id, player, gate_node_id, terminal_node_ids,
                     weather, process_nodes, processed_node_ids,
+                    avoid_nodes=avoid_route_nodes,
                 )
                 if direct_target:
                     if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        return _handle_force_delivery_blocker(
+                        blocker_action = _handle_force_delivery_blocker(
                             match_id, round_num, player_id, player,
                             direct_target, inquire_nodes, tasks, failed_task_ids,
                             obstacle_nodes, my_team_id,
                         )
-                    choke_action = _handle_key_choke_forced_pass(
-                        match_id, round_num, player_id,
-                        current_node_id, direct_target, forced_pass_failed_targets,
-                    )
-                    if choke_action is not None:
-                        return choke_action
-                    horse_action = _handle_key_choke_horse(
+                        if blocker_action.get("msg_data", {}).get("actions"):
+                            return blocker_action
+                    hop_action = _resolve_guarded_delivery_hop(
                         match_id, round_num, player_id, player,
-                        current_node_id, direct_target,
+                        current_node_id, direct_target, forced_pass_failed_targets,
+                        inquire_nodes, tasks, failed_task_ids, obstacle_nodes,
+                        my_team_id, route_blocked,
+                    )
+                    if hop_action is not None:
+                        return hop_action
+                    horse_action = _use_horse_before_expensive_hop(
+                        match_id, round_num, player_id, player, graph,
+                        current_node_id, direct_target, weather, process_nodes,
                     )
                     if horse_action is not None:
                         return horse_action
@@ -310,6 +327,14 @@ def _decide_action_impl(
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
             if guard_target:
+                if force_delivery:
+                    blocker_action = _handle_force_delivery_blocker(
+                        match_id, round_num, player_id, player,
+                        guard_target, inquire_nodes, tasks, failed_task_ids,
+                        obstacle_nodes, my_team_id,
+                    )
+                    if blocker_action.get("msg_data", {}).get("actions"):
+                        return blocker_action
                 return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, guard_target, my_team_id,
@@ -321,6 +346,14 @@ def _decide_action_impl(
 
             if next_node:
                 if next_node in route_blocked:
+                    if force_delivery:
+                        blocker_action = _handle_force_delivery_blocker(
+                            match_id, round_num, player_id, player,
+                            next_node, inquire_nodes, tasks, failed_task_ids,
+                            obstacle_nodes, my_team_id,
+                        )
+                        if blocker_action.get("msg_data", {}).get("actions"):
+                            return blocker_action
                     return _wait_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, next_node, my_team_id,
@@ -344,6 +377,14 @@ def _decide_action_impl(
         if state == "MOVING":
             if guard_target or last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
                 target = guard_target or player.get("nextNodeId", "")
+                if force_delivery and target:
+                    blocker_action = _handle_force_delivery_blocker(
+                        match_id, round_num, player_id, player,
+                        target, inquire_nodes, tasks, failed_task_ids,
+                        obstacle_nodes, my_team_id,
+                    )
+                    if blocker_action.get("msg_data", {}).get("actions"):
+                        return blocker_action
                 return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, target, my_team_id,
@@ -498,6 +539,7 @@ def _decide_action_impl(
     use_res_action = _handle_use_resources(
         match_id, round_num, player_id, player,
         current_node_id, graph, weather, phase,
+        gate_node_id, terminal_node_ids, process_nodes, processed_node_ids,
     )
     if use_res_action is not None:
         return use_res_action
@@ -512,6 +554,9 @@ def _decide_action_impl(
             process_nodes=process_nodes,
             visited_node_ids=visited_node_ids,
             my_team_id=my_team_id,
+            tasks=tasks,
+            failed_task_ids=failed_task_ids,
+            squad_clear_pending=squad_clear_pending,
         )
         if combat_action is not None:
             return combat_action
@@ -531,9 +576,19 @@ def _decide_action_impl(
 
     # --- NAVIGATION: Move toward goal ---
     if force_delivery:
+        guard_action = _try_set_guard_action(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
+            weather, obstacle_nodes, inquire_nodes, my_team_id,
+            opp_player, mode, phase, force_delivery=True,
+        )
+        if guard_action is not None:
+            return guard_action
+
         direct_target = _find_direct_delivery_step(
             graph, current_node_id, player, gate_node_id, terminal_node_ids,
             weather, process_nodes, processed_node_ids,
+            avoid_nodes=avoid_route_nodes,
         )
         if direct_target:
             if direct_target in route_blocked or direct_target in obstacle_nodes:
@@ -544,15 +599,17 @@ def _decide_action_impl(
                 )
                 if blocker_action.get("msg_data", {}).get("actions"):
                     return blocker_action
-            choke_action = _handle_key_choke_forced_pass(
-                match_id, round_num, player_id,
-                current_node_id, direct_target, forced_pass_failed_targets,
-            )
-            if choke_action is not None:
-                return choke_action
-            horse_action = _handle_key_choke_horse(
+            hop_action = _resolve_guarded_delivery_hop(
                 match_id, round_num, player_id, player,
-                current_node_id, direct_target,
+                current_node_id, direct_target, forced_pass_failed_targets,
+                inquire_nodes, tasks, failed_task_ids, obstacle_nodes,
+                my_team_id, route_blocked,
+            )
+            if hop_action is not None:
+                return hop_action
+            horse_action = _use_horse_before_expensive_hop(
+                match_id, round_num, player_id, player, graph,
+                current_node_id, direct_target, weather, process_nodes,
             )
             if horse_action is not None:
                 return horse_action
@@ -711,11 +768,102 @@ def _get_goal_node(
     return None
 
 
-def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
-    """Stop optional scoring once delivery risk is higher than task/resource value."""
+def _get_node_guard(inquire_nodes: list[dict], node_id: str) -> dict:
+    for node in inquire_nodes:
+        if node.get("nodeId") == node_id:
+            guard = node.get("guard")
+            return guard if isinstance(guard, dict) else {}
+    return {}
+
+
+def _estimate_delivery_eta(
+    graph: MapGraph,
+    current_node_id: str,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str] | None,
+) -> float:
+    """Estimate frames needed to reach delivery-ready state along the planned route."""
+    if not current_node_id:
+        return float("inf")
+
+    remaining_process = process_nodes
+    if process_nodes and processed_node_ids is not None:
+        remaining_process = {
+            nid: info for nid, info in process_nodes.items()
+            if nid not in processed_node_ids
+        }
+
+    goal = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, None, remaining_process,
+    )
+    if not goal:
+        return 0.0
+
+    path = graph.weighted_shortest_path(
+        current_node_id, goal, weather, None, remaining_process,
+    )
+    if not path and remaining_process is not process_nodes:
+        path = graph.weighted_shortest_path(
+            current_node_id, goal, weather, None, process_nodes,
+        )
+    if not path:
+        return float("inf")
+
+    total = sum(
+        graph.edge_cost(path[i], path[i + 1], weather, None, remaining_process)
+        for i in range(len(path) - 1)
+    )
+    if not is_verified(player) and gate_node_id:
+        total += 18
+    elif is_verified(player):
+        total += 4
+    return total
+
+
+def _should_force_delivery(
+    round_num: int,
+    phase: str,
+    player: dict,
+    graph: MapGraph | None = None,
+    current_node_id: str | None = None,
+    gate_node_id: str = "",
+    terminal_node_ids: list[str] | None = None,
+    weather: dict | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
+    max_round: int = MAX_ROUND,
+) -> bool:
+    """Stop optional scoring when remaining time is tight for delivery ETA."""
     if phase == "RUSH":
         return True
-    if round_num >= 220:
+
+    task_score = get_task_score(player)
+    if task_score >= TASK_SCORE_TARGET:
+        return True
+
+    remaining = max(0, max_round - round_num)
+    if remaining <= 0:
+        return True
+
+    if graph is None or not current_node_id:
+        return remaining <= int(max_round * 0.33)
+
+    eta = _estimate_delivery_eta(
+        graph, current_node_id, player, gate_node_id,
+        terminal_node_ids or [], weather, process_nodes, processed_node_ids,
+    )
+    buffer = 12.0
+
+    if eta >= remaining - buffer:
+        return True
+    if task_score >= 60 and eta >= (remaining - buffer) * 0.8:
+        return True
+    if remaining <= int(max_round * 0.33):
         return True
     return False
 
@@ -729,6 +877,7 @@ def _find_direct_delivery_step(
     weather: dict | None,
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
+    avoid_nodes: set[str] | None = None,
 ) -> str | None:
     goal_node = _get_goal_node(
         player, gate_node_id, terminal_node_ids, graph,
@@ -744,12 +893,38 @@ def _find_direct_delivery_step(
             if nid not in processed_node_ids
         }
 
-    # Ignore guards/obstacles here. If the direct next hop is blocked, handle
-    # that blocker explicitly instead of oscillating through detours.
+    if avoid_nodes:
+        neighbors = graph.get_neighbors(current_node_id)
+        best_step = None
+        best_cost = float("inf")
+        for neighbor in neighbors:
+            if neighbor in avoid_nodes:
+                continue
+            path = graph.weighted_shortest_path(
+                neighbor, goal_node, weather, None, remaining_process_nodes,
+            )
+            if not path:
+                continue
+            hop_cost = graph.edge_cost(
+                current_node_id, neighbor, weather, None, remaining_process_nodes,
+            )
+            tail_cost = sum(
+                graph.edge_cost(path[i], path[i + 1], weather, None, remaining_process_nodes)
+                for i in range(len(path) - 1)
+            )
+            total = hop_cost + tail_cost
+            if total < best_cost:
+                best_cost = total
+                best_step = neighbor
+        if best_step:
+            return best_step
+
     step = graph.next_step_toward(
         current_node_id, goal_node, weather, None,
         use_weighted=True, process_nodes=remaining_process_nodes,
     )
+    if step and avoid_nodes and step in avoid_nodes:
+        return None
     if step:
         return step
     return graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
@@ -807,43 +982,88 @@ def _handle_force_delivery_blocker(
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
 
-def _handle_key_choke_forced_pass(
-    match_id: str,
-    round_num: int,
-    player_id: int,
-    current_node_id: str,
-    target_node_id: str,
-    forced_pass_failed_targets: set[str],
-) -> dict | None:
-    """Probe the S10 choke before committing to an edge where only WAIT is legal."""
-    if current_node_id != "S09" or target_node_id != "S10":
-        return None
-    if target_node_id in forced_pass_failed_targets:
-        if round_num < 306:
-            logger.info("Round %d: FORCE_DELIVERY holding at S09 for S10 guard window", round_num)
-            return make_action(match_id, round_num, player_id, [make_wait_action()])
-        return None
-    logger.info("Round %d: FORCE_DELIVERY forced pass probe at key choke %s", round_num, target_node_id)
-    return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
-
-
-def _handle_key_choke_horse(
+def _resolve_guarded_delivery_hop(
     match_id: str,
     round_num: int,
     player_id: int,
     player: dict,
     current_node_id: str,
     target_node_id: str,
+    forced_pass_failed_targets: set[str],
+    inquire_nodes: list[dict],
+    tasks: list[dict],
+    failed_task_ids: set[str],
+    obstacle_nodes: set[str],
+    my_team_id: str,
+    route_blocked: set[str],
 ) -> dict | None:
-    """Use saved horse before the long S09->S10 crossing."""
-    if current_node_id != "S09" or target_node_id != "S10":
+    """Resolve a guarded/obstructed delivery hop using live state, not fixed timers."""
+    if target_node_id in obstacle_nodes:
+        return _handle_force_delivery_blocker(
+            match_id, round_num, player_id, player,
+            target_node_id, inquire_nodes, tasks, failed_task_ids,
+            obstacle_nodes, my_team_id,
+        )
+
+    guard = _get_node_guard(inquire_nodes, target_node_id)
+    guarded = (
+        target_node_id in route_blocked
+        or is_enemy_guard(guard, my_team_id, player_id)
+    )
+    if not guarded:
+        return None
+
+    if target_node_id in forced_pass_failed_targets:
+        return _handle_force_delivery_blocker(
+            match_id, round_num, player_id, player,
+            target_node_id, inquire_nodes, tasks, failed_task_ids,
+            obstacle_nodes, my_team_id,
+        )
+
+    logger.info(
+        "Round %d: probing guarded hop %s with FORCED_PASS",
+        round_num, target_node_id,
+    )
+    return make_action(match_id, round_num, player_id, [
+        make_forced_pass_action(target_node_id)
+    ])
+
+
+def _use_horse_before_expensive_hop(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    target_node_id: str,
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+) -> dict | None:
+    """Use horse buff before a high-cost edge during forced delivery."""
+    if not target_node_id or current_node_id == target_node_id:
+        return None
+    hop_cost = graph.edge_cost(
+        current_node_id, target_node_id, weather, None, process_nodes,
+    )
+    if hop_cost < 40:
         return None
     if has_resource(player, "FAST_HORSE"):
-        logger.info("Round %d: FORCE_DELIVERY using FAST_HORSE for S09->S10", round_num)
-        return make_action(match_id, round_num, player_id, [make_use_resource_action("FAST_HORSE")])
+        logger.info(
+            "Round %d: Using FAST_HORSE before hop %s->%s (cost=%.1f)",
+            round_num, current_node_id, target_node_id, hop_cost,
+        )
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("FAST_HORSE")
+        ])
     if has_resource(player, "SHORT_HORSE"):
-        logger.info("Round %d: FORCE_DELIVERY using SHORT_HORSE for S09->S10", round_num)
-        return make_action(match_id, round_num, player_id, [make_use_resource_action("SHORT_HORSE")])
+        logger.info(
+            "Round %d: Using SHORT_HORSE before hop %s->%s (cost=%.1f)",
+            round_num, current_node_id, target_node_id, hop_cost,
+        )
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("SHORT_HORSE")
+        ])
     return None
 
 
@@ -1008,84 +1228,140 @@ def _find_contest(contest_id: str, contests: list[dict] | None) -> dict | None:
     return None
 
 
+# 窗口牌克制表 (任务书 §5.4.4): CARD_BEATS[c] = c 能击败的牌集合。
+# 献贡/兵争各克 2 张、只平 1 张(强牌); 验牒/强行各克 1 张、平 2 张(弱牌)。
+CARD_BEATS: dict[str, set[str]] = {
+    "YAN_DIE": {"QIANG_XING"},
+    "QIANG_XING": {"XIAN_GONG"},
+    "XIAN_GONG": {"YAN_DIE", "BING_ZHENG"},
+    "BING_ZHENG": {"YAN_DIE", "QIANG_XING"},
+}
+
+# 各牌的相对成本罚分(资源稀缺度)。价值高的窗口会弱化罚分。
+# 兵争消耗护卫行动点(全局仅4点,最稀缺); 强行会消耗宝贵马类(应留给加速);
+# 献贡消耗1好果; 验牒消耗文书资源(过所/官凭,本就用于出牌,最廉价)。
+CARD_COST_PENALTY: dict[str, float] = {
+    "YAN_DIE": 1.0,
+    "XIAN_GONG": 1.6,
+    "QIANG_XING": 2.6,
+    "BING_ZHENG": 3.2,
+    "ABSTAIN": 0.0,
+}
+
+_ALL_EFFECTIVE_CARDS = ("YAN_DIE", "QIANG_XING", "XIAN_GONG", "BING_ZHENG")
+
+
+def _window_card_result(mine: str, theirs: str) -> int:
+    """本拍胜负 (任务书 §5.4.4): 胜=1, 平=0, 负=-1。"""
+    if mine == theirs:
+        return 0
+    if theirs == "ABSTAIN":
+        return 1 if mine != "ABSTAIN" else 0
+    if mine == "ABSTAIN":
+        return -1
+    if theirs in CARD_BEATS.get(mine, ()):
+        return 1
+    if mine in CARD_BEATS.get(theirs, ()):
+        return -1
+    return 0
+
+
+def _affordable_window_cards(p: dict | None) -> set[str]:
+    """依据公开状态推断某方本拍买得起哪些有效牌 (任务书 §5.4.3)。"""
+    if not p:
+        return set()
+    cards: set[str] = set()
+    resources = get_player_resources(p)
+    if resources.get("PASS_TOKEN", 0) + resources.get("OFFICIAL_PERMIT", 0) > 0:
+        cards.add("YAN_DIE")
+    if has_resource(p, "FAST_HORSE") or has_resource(p, "SHORT_HORSE"):
+        cards.add("QIANG_XING")
+    if get_good_fruit(p) >= 1 and get_freshness(p) >= 80:
+        cards.add("XIAN_GONG")
+    if get_action_points(p) > 0:
+        cards.add("BING_ZHENG")
+    return cards
+
+
+def _contest_value_profile(
+    contest_type: str, contest: dict | None, on_water_route: bool,
+) -> tuple[bool, float]:
+    """返回 (是否必争, 价值权重0..1)。价值越高越值得付成本、越可能弃权亏。"""
+    if contest_type == "GATE":
+        return True, 1.0
+    if contest_type == "PASS":
+        return False, 0.8
+    if contest_type in ("TASK", "OBSTACLE"):
+        score = contest.get("taskScore", 0) if contest else 0
+        return (False, 0.6) if score >= 30 else (False, 0.0)
+    if contest_type == "DOCK":
+        return (False, 0.5) if on_water_route else (False, 0.0)
+    if contest_type == "RESOURCE":
+        return False, 0.45
+    return False, 0.0
+
+
 def _choose_window_card(
     contest_type: str, contest: dict | None,
     my_player: dict, all_players: list[dict], phase: str,
     on_water_route: bool = False,
 ) -> str:
-    """Choose window card based on contest type (策略文档 §7.3).
+    """博弈式窗口出牌 (任务书 §5.4)。
 
-    克制关系: 验牒(YAN_DIE) 克 强行(QIANG_XING) 克 献贡(XIAN_GONG) 克 兵争(BING_ZHENG) 克 验牒
+    核心: 对手资源/好果/鲜度/行动点均为公开状态, 由此推断对手本拍能出哪些牌,
+    再用正确克制表做期望胜点最大化, 同时按窗口价值权衡稀缺资源成本。
+    不写死固定优先级, 随对手手牌与窗口价值自适应。
     """
-    resources = get_player_resources(my_player)
-    action_points = get_action_points(my_player)
+    must_win, value = _contest_value_profile(contest_type, contest, on_water_route)
 
-    # Card availability
-    has_yan_die = resources.get("PASS_TOKEN", 0) + resources.get("OFFICIAL_PERMIT", 0) > 0
-    has_bing_zheng = action_points > 0
-    has_xian_gong = get_good_fruit(my_player) >= 1 and get_freshness(my_player) >= 80
-    has_qiang_xing = has_resource(my_player, "FAST_HORSE") or has_resource(my_player, "SHORT_HORSE")
-
-    # Strategy by contest type
-    if contest_type == "GATE":
-        # Must contest gate (策略文档 §7.3: GATE必争)
-        if has_bing_zheng:
-            return "BING_ZHENG"
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_xian_gong:
-            return "XIAN_GONG"
-        return "QIANG_XING"
-
-    if contest_type == "RESOURCE":
-        # Contest for important resources (fast horse, official permit)
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_bing_zheng:
-            return "BING_ZHENG"
-        return "ABSTAIN"  # Not critical enough to spend fruit
-
-    if contest_type == "TASK":
-        # Contest for 30-point tasks (策略文档 §7.3: 30分争, 15分不顺路弃权)
-        if contest and contest.get("taskScore", 0) >= 30:
-            if has_bing_zheng:
-                return "BING_ZHENG"
-            if has_yan_die:
-                return "YAN_DIE"
-            return "ABSTAIN"
-        return "ABSTAIN"  # 15-point tasks not worth contesting
-
-    if contest_type == "DOCK":
-        # Only contest DOCK if on water route (策略文档 §7.3: 走水路必争, 官道路线弃权)
-        if not on_water_route:
-            return "ABSTAIN"
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_bing_zheng:
-            return "BING_ZHENG"
+    my_cards = _affordable_window_cards(my_player)
+    # 低价值且非必争的窗口: 直接弃权, 保留资源。
+    if not must_win and value <= 0.0:
+        return "ABSTAIN"
+    if not my_cards:
         return "ABSTAIN"
 
-    if contest_type == "PASS":
-        # PASS contest: offensive (强行/验牒) vs defensive (策略文档 §7.3)
-        # Attacker wants to pass → qiang_xing or yan_die
-        # Defender → based on cost (abstain if time tax acceptable)
-        if has_yan_die:
-            return "YAN_DIE"
-        if has_qiang_xing:
-            return "QIANG_XING"
-        return "ABSTAIN"
+    opp = _find_opponent(all_players, my_player.get("playerId"))
+    opp_cards = _affordable_window_cards(opp)
 
-    if contest_type == "OBSTACLE":
-        # Only contest for T04 (30 points) at obstacle
-        if contest and contest.get("taskScore", 0) >= 30:
-            if has_bing_zheng:
-                return "BING_ZHENG"
-            if has_yan_die:
-                return "YAN_DIE"
-        return "ABSTAIN"
+    # 估计对手本拍出牌的概率权重。
+    opp_weights: dict[str, float] = {}
+    if opp is None:
+        # 完全观测不到对手对象(信息缺失): 保守假设各有效牌均可能。
+        for c in _ALL_EFFECTIVE_CARDS:
+            opp_weights[c] = 0.5
+        opp_weights["ABSTAIN"] = 1.0
+    elif opp_cards:
+        for c in opp_cards:
+            opp_weights[c] = 1.0
+        # 窗口越重要, 对手越可能认真出牌 → 弃权权重越低。
+        opp_weights["ABSTAIN"] = max(0.1, 1.0 - value)
+    else:
+        # 公开状态显示对手买不起任何有效牌 → 对手本拍只能弃权,
+        # 此时任意有效牌皆胜, 交由成本罚分挑最省的一张。
+        opp_weights["ABSTAIN"] = 1.0
 
-    # Default: abstain
-    return "ABSTAIN"
+    total_w = sum(opp_weights.values()) or 1.0
+
+    def expected(card: str) -> float:
+        return sum(w * _window_card_result(card, o) for o, w in opp_weights.items()) / total_w
+
+    best_card = "ABSTAIN"
+    best_adj = float("-inf") if must_win else 0.0
+    for card in my_cards:
+        exp = expected(card)
+        # 成本罚分随窗口价值弱化, 但始终保留下限, 使期望相等时优选省资源的牌。
+        penalty = CARD_COST_PENALTY.get(card, 1.0) * max(0.03, (1.0 - value) * 0.2)
+        adj = exp - penalty
+        if adj > best_adj:
+            best_adj = adj
+            best_card = card
+
+    # 必争窗口(如宫门)绝不弃权: 退化为纯期望最高的有效牌。
+    if must_win and best_card == "ABSTAIN":
+        best_card = max(my_cards, key=expected)
+
+    return best_card
 
 
 def _get_pending_station_process_type(
@@ -1335,7 +1611,11 @@ def _handle_tasks(
         failed_task_ids = set()
 
     my_task_score = get_task_score(player)
-    if _should_force_delivery(round_num, phase, player):
+    if _should_force_delivery(
+        round_num, phase, player, graph, current_node_id,
+        goal_node_id, terminal_node_ids, weather,
+        process_nodes, processed_node_ids,
+    ):
         return None
 
     # Already at stretch target, don't need more tasks
@@ -1544,18 +1824,26 @@ def _handle_force_delivery_resource(
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
 ) -> dict | None:
-    """Claim only resources that directly shorten the forced delivery route."""
+    """Claim route-shortening resources on the current node when the next hop is expensive."""
     if current_node is None or has_resource(player, "FAST_HORSE"):
         return None
     direct_target = _find_direct_delivery_step(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
     )
-    if current_node_id != "S09" or direct_target != "S10":
+    if not direct_target:
+        return None
+    hop_cost = graph.edge_cost(
+        current_node_id, direct_target, weather, None, process_nodes,
+    )
+    if hop_cost < 40:
         return None
     for rtype, _count in find_available_resources(current_node):
         if rtype == "FAST_HORSE":
-            logger.info("Round %d: FORCE_DELIVERY claiming FAST_HORSE at %s", round_num, current_node_id)
+            logger.info(
+                "Round %d: FORCE_DELIVERY claiming FAST_HORSE at %s (next hop cost=%.1f)",
+                round_num, current_node_id, hop_cost,
+            )
             return make_action(match_id, round_num, player_id, [
                 make_claim_resource_action(current_node_id, rtype)
             ])
@@ -1566,58 +1854,280 @@ def _handle_use_resources(
     match_id: str, round_num: int, player_id: int,
     player: dict, current_node_id: str, graph: MapGraph,
     weather: dict | None, phase: str,
+    gate_node_id: str = "",
+    terminal_node_ids: list[str] | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
 ) -> dict | None:
     """Handle using resources: ice box, horses (策略文档 §6.1)."""
     freshness = get_freshness(player)
 
-    # Use ICE_BOX when freshness is low or preemptively before bad weather/routes
-    # (策略文档 §6.1: 鲜度<72 或酷暑/山路前)
-    if has_resource(player, "ICE_BOX"):
-        use_ice = False
-        if freshness < ICE_BOX_FRESHNESS_THRESHOLD:
-            use_ice = True
-        # Preemptive: check if next route segment is mountain or hot weather
-        elif weather and freshness < 80:
-            forecasts = weather.get("forecast", [])
-            for fw in forecasts:
-                wtype = fw.get("type", "")
-                if wtype == "HOT":
-                    use_ice = True
-                    break
-        if not use_ice:
-            # Check if next step goes through mountain
-            neighbors = graph.get_neighbors(current_node_id)
-            for n in neighbors:
-                if graph.get_edge_route_type(current_node_id, n) == "MOUNTAIN" and freshness < 80:
-                    use_ice = True
-                    break
-        if use_ice:
-            logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
-            return make_action(match_id, round_num, player_id, [
-                make_use_resource_action("ICE_BOX")
-            ])
+    if has_resource(player, "ICE_BOX") and freshness <= ICE_BOX_FRESHNESS_THRESHOLD:
+        logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("ICE_BOX")
+        ])
 
-    force_delivery = _should_force_delivery(round_num, phase, player)
-
-    # Save horse buffs for forced delivery; using them mid-route wastes the short duration.
-    if force_delivery and has_resource(player, "FAST_HORSE"):
-        neighbors = graph.get_neighbors(current_node_id)
-        for n in neighbors:
-            if graph.get_edge_route_type(current_node_id, n) == "ROAD":
-                logger.info("Round %d: Using FAST_HORSE before road move", round_num)
-                return make_action(match_id, round_num, player_id, [
-                    make_use_resource_action("FAST_HORSE")
-                ])
-
-    if force_delivery and has_resource(player, "SHORT_HORSE") and not has_resource(player, "FAST_HORSE"):
-        neighbors = graph.get_neighbors(current_node_id)
-        if neighbors:
-            logger.info("Round %d: Using SHORT_HORSE before move", round_num)
-            return make_action(match_id, round_num, player_id, [
-                make_use_resource_action("SHORT_HORSE")
-            ])
+    force_delivery = _should_force_delivery(
+        round_num, phase, player, graph, current_node_id,
+        gate_node_id, terminal_node_ids, weather,
+        process_nodes, processed_node_ids,
+    )
+    if force_delivery:
+        direct_target = _find_direct_delivery_step(
+            graph, current_node_id, player, gate_node_id,
+            terminal_node_ids or [], weather, process_nodes,
+            processed_node_ids or set(),
+        )
+        if direct_target:
+            horse_action = _use_horse_before_expensive_hop(
+                match_id, round_num, player_id, player, graph,
+                current_node_id, direct_target, weather, process_nodes,
+            )
+            if horse_action is not None:
+                return horse_action
 
     return None
+
+
+def _node_has_planned_t04(
+    tasks: list[dict],
+    node_id: str,
+    failed_task_ids: set[str],
+    my_task_score: int,
+) -> bool:
+    """Skip squad clear when we still plan to claim T04 at this node for task points."""
+    if my_task_score >= TASK_SCORE_TARGET:
+        return False
+    for task in tasks:
+        if task.get("nodeId") != node_id:
+            continue
+        if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
+            continue
+        if not get_task_template_id(task).startswith("T04"):
+            continue
+        task_id = task.get("taskId", "")
+        if task_id and task_id in failed_task_ids:
+            continue
+        return True
+    return False
+
+
+def _path_nodes_to_goal(
+    graph: MapGraph,
+    start_node_id: str,
+    goal_node_id: str,
+    weather: dict | None,
+    obstacle_nodes: set[str],
+) -> list[str]:
+    if not start_node_id or not goal_node_id:
+        return []
+    path = graph.shortest_path(start_node_id, goal_node_id, weather, obstacle_nodes)
+    return path or []
+
+
+def _score_squad_clear_target(
+    node_id: str,
+    my_path: list[str],
+    opp_path: list[str],
+) -> float:
+    """Higher score = more valuable to clear (own route, opponent tax, shared choke)."""
+    on_my_path = node_id in my_path
+    on_opp_path = bool(opp_path) and node_id in opp_path
+    score = 0.0
+    if on_my_path:
+        score += 12.0
+    if on_opp_path:
+        score += 9.0
+    if on_my_path and on_opp_path:
+        score += 4.0
+    elif on_opp_path and not on_my_path:
+        score += 3.0
+    return score
+
+
+def _find_squad_clear_target(
+    graph: MapGraph,
+    current_node_id: str,
+    goal_node_id: str,
+    inquire_nodes: list[dict],
+    obstacle_nodes: set[str],
+    weather: dict | None,
+    opp_player: dict | None,
+    tasks: list[dict],
+    failed_task_ids: set[str],
+    my_task_score: int,
+    squad_count: int,
+    squad_clear_pending: set[str],
+) -> str | None:
+    """Pick obstacle node for SQUAD_CLEAR: own route first, then opponent tax routes."""
+    if squad_count < SQUAD_CLEAR_MIN_SQUAD:
+        return None
+
+    my_path = _path_nodes_to_goal(
+        graph, current_node_id, goal_node_id, weather, obstacle_nodes,
+    )
+    opp_path: list[str] = []
+    if opp_player:
+        opp_node = opp_player.get("currentNodeId", "")
+        if opp_node:
+            opp_path = _path_nodes_to_goal(
+                graph, opp_node, goal_node_id, weather, obstacle_nodes,
+            )
+
+    best_node = ""
+    best_score = float("-inf")
+    for node in inquire_nodes:
+        if not node.get("hasObstacle", False):
+            continue
+        nid = node.get("nodeId", "")
+        if not nid or nid == current_node_id or nid in squad_clear_pending:
+            continue
+        if _node_has_planned_t04(tasks, nid, failed_task_ids, my_task_score):
+            continue
+
+        score = _score_squad_clear_target(nid, my_path, opp_path)
+        if score <= 0:
+            continue
+
+        # Tight squad budget: only clear obstacles on our own planned route.
+        if squad_count <= SQUAD_CLEAR_MIN_SQUAD + 1 and score < 12.0:
+            continue
+        # Moderate budget: require value on at least one meaningful path.
+        if score < 9.0:
+            continue
+
+        if score > best_score:
+            best_score = score
+            best_node = nid
+
+    return best_node or None
+
+
+def _count_own_active_guards(
+    inquire_nodes: list[dict], my_team_id: str, player_id: int,
+) -> int:
+    return sum(
+        1 for node in inquire_nodes
+        if is_own_guard(node.get("guard"), my_team_id, player_id)
+    )
+
+
+def _own_guard_active_at(
+    inquire_nodes: list[dict], node_id: str,
+    my_team_id: str, player_id: int,
+) -> bool:
+    return is_own_guard(_get_node_guard(inquire_nodes, node_id), my_team_id, player_id)
+
+
+def _is_key_choke_node(graph: MapGraph, node_id: str) -> bool:
+    return len(graph.get_neighbors(node_id)) <= 4
+
+
+def _guard_extra_good_fruit(player: dict) -> int:
+    good = get_good_fruit(player)
+    if good >= 1 + 1 + GUARD_GOOD_FRUIT_RESERVE:
+        return 1
+    return 0
+
+
+def _should_set_guard_dynamic(
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    obstacle_nodes: set[str],
+    player: dict,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    player_id: int,
+    opp_player: dict | None,
+    mode: str,
+    phase: str,
+    *,
+    force_delivery: bool = False,
+) -> tuple[bool, str]:
+    """Decide whether to SET_GUARD at the fleet's current node."""
+    goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
+    if not goal or not current_node_id:
+        return False, ""
+
+    if _count_own_active_guards(inquire_nodes, my_team_id, player_id) >= MAX_ACTIVE_GUARDS:
+        return False, "max-guards"
+    if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
+        return False, "already-guarded"
+
+    extra = _guard_extra_good_fruit(player)
+    if get_good_fruit(player) < 1 + extra + GUARD_GOOD_FRUIT_RESERVE:
+        return False, "low-fruit"
+
+    if phase == "RUSH" and gate_node_id and current_node_id == gate_node_id:
+        return True, "rush-gate"
+
+    if mode == "GATE_FIGHT":
+        if _is_key_choke_node(graph, current_node_id):
+            return True, "gate-fight-choke"
+        if gate_node_id and current_node_id == gate_node_id:
+            return True, "gate-fight-gate"
+        return False, "gate-fight-skip"
+
+    if not opp_player:
+        return False, "no-opp"
+    opp_node = opp_player.get("currentNodeId", "")
+    if not opp_node:
+        return False, "no-opp-node"
+
+    my_hops = graph.path_length(current_node_id, goal, weather, obstacle_nodes)
+    opp_hops = graph.path_length(opp_node, goal, weather, obstacle_nodes)
+    if my_hops == float("inf") or opp_hops == float("inf"):
+        return False, "unreachable"
+    if opp_hops <= my_hops:
+        return False, "not-leading"
+
+    opp_path = _path_nodes_to_goal(graph, opp_node, goal, weather, obstacle_nodes)
+    if current_node_id not in opp_path:
+        return False, "not-on-opp-path"
+
+    my_path = _path_nodes_to_goal(graph, current_node_id, goal, weather, obstacle_nodes)
+    if current_node_id in my_path:
+        if not _is_key_choke_node(graph, current_node_id):
+            return False, "on-my-path-not-choke"
+        lead = opp_hops - my_hops
+        if lead < 2:
+            return False, "on-my-path-insufficient-lead"
+
+    lead = int(opp_hops - my_hops)
+    reason = f"ahead({lead}),opp-path"
+    if _is_key_choke_node(graph, current_node_id):
+        reason += ",choke"
+    if force_delivery:
+        reason += ",force-delivery"
+    return True, reason
+
+
+def _try_set_guard_action(
+    match_id: str, round_num: int, player_id: int,
+    player: dict, graph: MapGraph,
+    current_node_id: str, gate_node_id: str, terminal_node_ids: list[str],
+    weather: dict | None, obstacle_nodes: set[str],
+    inquire_nodes: list[dict], my_team_id: str,
+    opp_player: dict | None, mode: str, phase: str,
+    *, force_delivery: bool = False,
+) -> dict | None:
+    should, reason = _should_set_guard_dynamic(
+        graph, current_node_id, gate_node_id, terminal_node_ids,
+        weather, obstacle_nodes, player, inquire_nodes,
+        my_team_id, player_id, opp_player, mode, phase,
+        force_delivery=force_delivery,
+    )
+    if not should:
+        return None
+    extra = _guard_extra_good_fruit(player)
+    logger.info("Round %d: Setting guard at %s (%s)", round_num, current_node_id, reason)
+    return make_action(match_id, round_num, player_id, [
+        make_set_guard_action(current_node_id, extra_good_fruit=extra)
+    ])
 
 
 def _handle_combat(
@@ -1631,6 +2141,9 @@ def _handle_combat(
     process_nodes: dict[str, dict] | None = None,
     visited_node_ids: set[str] | None = None,
     my_team_id: str = "",
+    tasks: list[dict] | None = None,
+    failed_task_ids: set[str] | None = None,
+    squad_clear_pending: set[str] | None = None,
 ) -> dict | None:
     """Handle combat: guard, break, squad (策略文档 §8)."""
     if obstacle_nodes is None:
@@ -1639,25 +2152,24 @@ def _handle_combat(
         process_nodes = {}
     if visited_node_ids is None:
         visited_node_ids = set()
+    if tasks is None:
+        tasks = []
+    if failed_task_ids is None:
+        failed_task_ids = set()
+    if squad_clear_pending is None:
+        squad_clear_pending = set()
     if not my_team_id:
         my_team_id = get_team_id(player)
 
-    # SET_GUARD 仅在关口争夺或 RUSH 阶段守宫门时（开局设卡浪费帧数）
-    should_set_guard = (
-        mode == "GATE_FIGHT"
-        or (phase == "RUSH" and gate_node_id and current_node_id == gate_node_id)
+    # --- SET_GUARD: dynamic choke / opp-path / lead-based ---
+    guard_action = _try_set_guard_action(
+        match_id, round_num, player_id, player, graph,
+        current_node_id, gate_node_id, terminal_node_ids,
+        weather, obstacle_nodes, inquire_nodes, my_team_id,
+        opp_player, mode, phase,
     )
-    if should_set_guard and get_good_fruit(player) >= 1:
-        guard_target = _find_guard_target(
-            graph, current_node_id, gate_node_id, terminal_node_ids,
-            weather, blocked, player, inquire_nodes, my_team_id,
-        )
-        if guard_target and guard_target == current_node_id:
-            logger.info("Round %d: Setting guard at current node %s", round_num, guard_target)
-            extra = 1 if get_good_fruit(player) >= 2 else 0
-            return make_action(match_id, round_num, player_id, [
-                make_set_guard_action(guard_target, extra_good_fruit=extra)
-            ])
+    if guard_action is not None:
+        return guard_action
 
     # --- BREAK_GUARD with optional BREAK_ORDER (策略文档 §8.2, §10) ---
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
@@ -1703,22 +2215,35 @@ def _handle_combat(
                             make_squad_scout_action(nid)
                         ])
 
-        # SQUAD_CLEAR: Clear obstacles without main team (策略文档 §8.4: 2人手)
-        if squad_count >= 8:
-            for node in inquire_nodes:
-                if node.get("hasObstacle", False) and node.get("nodeId") != current_node_id:
-                    nid = node.get("nodeId", "")
-                    # Check if obstacle is on our path
-                    if goal:
-                        path = graph.shortest_path(current_node_id, goal, weather, obstacle_nodes)
-                        if path and nid in path:
-                            logger.info("Round %d: Squad clear at %s", round_num, nid)
-                            return make_action(match_id, round_num, player_id, [
-                                make_squad_clear_action(nid)
-                            ])
+        # SQUAD_CLEAR: own-route opening + opponent-route tax; keep late-game reserve.
+        if squad_count >= SQUAD_CLEAR_MIN_SQUAD and goal:
+            clear_target = _find_squad_clear_target(
+                graph, current_node_id, goal, inquire_nodes, obstacle_nodes,
+                weather, opp_player, tasks, failed_task_ids, my_task_score,
+                squad_count, squad_clear_pending,
+            )
+            if clear_target:
+                on_my = clear_target in _path_nodes_to_goal(
+                    graph, current_node_id, goal, weather, obstacle_nodes,
+                )
+                on_opp = bool(opp_player) and clear_target in _path_nodes_to_goal(
+                    graph, opp_player.get("currentNodeId", ""), goal, weather, obstacle_nodes,
+                )
+                reason = "own-route"
+                if on_my and on_opp:
+                    reason = "shared-choke"
+                elif on_opp and not on_my:
+                    reason = "opp-tax"
+                logger.info(
+                    "Round %d: Squad clear at %s (%s, squad=%d, reserve>=%d)",
+                    round_num, clear_target, reason, squad_count, SQUAD_RESERVE_FOR_LATE,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_squad_clear_action(clear_target)
+                ])
 
         # SQUAD_REINFORCE: Reinforce our own guard at key nodes (策略文档 §8.4: 2人手)
-        if squad_count >= 8:
+        if squad_count >= SQUAD_CLEAR_MIN_SQUAD:
             for node in inquire_nodes:
                 guard = node.get("guard", {})
                 owner_team = guard.get("ownerTeamId") if guard else ""
@@ -1742,35 +2267,6 @@ def _handle_combat(
                     return make_action(match_id, round_num, player_id, [
                         make_squad_weaken_action(nid)
                     ])
-
-    return None
-
-
-def _find_guard_target(
-    graph: MapGraph, current_node_id: str,
-    gate_node_id: str, terminal_node_ids: list[str],
-    weather: dict | None, blocked: set[str] | None,
-    player: dict, inquire_nodes: list[dict],
-    my_team_id: str,
-) -> str | None:
-    """Find a good node to set guard on (策略文档 §8.1).
-
-    Key: don't set guard on our own route. Target opponent's likely route.
-    """
-    # Find nodes that are NOT on our path to gate/terminal
-    goal = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, blocked)
-    if not goal:
-        return None
-
-    our_path = graph.weighted_shortest_path(current_node_id, goal, weather, blocked)
-    if our_path and current_node_id in our_path[-3:]:
-        return None
-
-    neighbors = graph.get_neighbors(current_node_id)
-    if len(neighbors) <= 3:
-        for node in inquire_nodes:
-            if node.get("nodeId") == current_node_id and not guard_is_active(node.get("guard")):
-                return current_node_id
 
     return None
 
