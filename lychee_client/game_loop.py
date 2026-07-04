@@ -50,6 +50,7 @@ class GameClient:
         self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
         self.forced_pass_failed_targets: set[str] = set()  # targets where blind forced pass was rejected this stop
         self.squad_clear_pending: set[str] = set()  # obstacles already dispatched SQUAD_CLEAR
+        self.own_guard_sites: set[str] = set()  # nodes where we placed SET_GUARD (advance separately)
         self.last_forced_pass_target = ""
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
@@ -367,6 +368,8 @@ class GameClient:
                     self.avoid_route_nodes.discard(node_id)
                     self.forced_pass_failed_targets.discard(node_id)
                     logger.info("Round %d: Guard broken at %s", inquire.round, node_id)
+                    if payload.get("ownerTeamId") == player.get("teamId", "") or payload.get("playerId") == self.player_id:
+                        self.own_guard_sites.discard(node_id)
             if ev_type == "OBSTACLE_CLEAR":
                 node_id = payload.get("nodeId") or payload.get("targetNodeId", "")
                 if node_id:
@@ -377,6 +380,7 @@ class GameClient:
                     self.guard_blocked_targets.discard(node_id)
                     self.avoid_route_nodes.discard(node_id)
                     self.forced_pass_failed_targets.discard(node_id)
+                    self.own_guard_sites.discard(node_id)
             if ev_type in ("PROCESS_COMPLETE", "VERIFY_GATE_COMPLETE"):
                 if payload.get("playerId") == self.player_id:
                     node_id = payload.get("nodeId") or payload.get("targetNodeId")
@@ -480,6 +484,7 @@ class GameClient:
             squad_clear_pending=self.squad_clear_pending,
             guard_stuck_rounds=self.guard_stuck_rounds,
             guard_stuck_target=self.guard_stuck_target,
+            own_guard_sites=self.own_guard_sites,
         )
 
         self.send_message(action_msg)
@@ -504,6 +509,15 @@ class GameClient:
                 target = action_item.get("targetNodeId", "")
                 if target:
                     self.squad_clear_pending.add(target)
+            if action_item.get("action") == "SET_GUARD":
+                target = action_item.get("targetNodeId", "")
+                if target:
+                    self.avoid_route_nodes.add(target)
+                    self.own_guard_sites.add(target)
+                    logger.info(
+                        "Round %d: Avoid own guard node %s after SET_GUARD (advance separately)",
+                        inquire.round, target,
+                    )
         if action_type == "MOVE":
             self.move_count += 1
         elif action_type in ("PROCESS", "DOCK", "VERIFY_GATE"):

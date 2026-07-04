@@ -29,7 +29,7 @@ from lychee_client.state import (
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
     RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY, MAX_ROUND,
     SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
-    MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE,
+    MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE, GUARD_MIN_LEAD_FIRST,
     GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
 )
@@ -117,6 +117,7 @@ def decide_action(
     squad_clear_pending: set[str] | None = None,
     guard_stuck_rounds: int = 0,
     guard_stuck_target: str = "",
+    own_guard_sites: set[str] | None = None,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -148,6 +149,8 @@ def decide_action(
         forced_pass_failed_targets = set()
     if squad_clear_pending is None:
         squad_clear_pending = set()
+    if own_guard_sites is None:
+        own_guard_sites = set()
 
     try:
         return _decide_action_impl(
@@ -159,7 +162,7 @@ def decide_action(
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
             forced_pass_failed_targets, squad_clear_pending,
-            guard_stuck_rounds, guard_stuck_target,
+            guard_stuck_rounds, guard_stuck_target, own_guard_sites,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -199,6 +202,7 @@ def _decide_action_impl(
     squad_clear_pending: set[str] | None = None,
     guard_stuck_rounds: int = 0,
     guard_stuck_target: str = "",
+    own_guard_sites: set[str] | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -208,6 +212,8 @@ def _decide_action_impl(
         forced_pass_failed_targets = set()
     if squad_clear_pending is None:
         squad_clear_pending = set()
+    if own_guard_sites is None:
+        own_guard_sites = set()
 
     # --- P0: Stability ---
     if is_retired(player) or is_delivered(player):
@@ -430,6 +436,15 @@ def _decide_action_impl(
         if task_retry is not None:
             return task_retry
 
+    leave_guard_action = _try_leave_own_guard_node(
+        match_id, round_num, player_id, player, graph,
+        current_node_id, gate_node_id, terminal_node_ids,
+        weather, route_blocked, avoid_route_nodes,
+        process_nodes, processed_node_ids, own_guard_sites,
+    )
+    if leave_guard_action is not None:
+        return leave_guard_action
+
     # Don't use blocked_nodes as hard filter in BFS — it causes TARGET_NOT_REACHABLE
     # Instead, use weighted routing to prefer unblocked paths
     blocked_soft = route_blocked  # used for weighted routing and combat
@@ -506,6 +521,17 @@ def _decide_action_impl(
             weather, blocked_soft, inquire_nodes, process_nodes=process_nodes,
         )
 
+    # --- Dual guard (before optional tasks): set at choke on opp path, then advance separately ---
+    if not force_delivery:
+        guard_action = _try_set_guard_action(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
+            weather, obstacle_nodes, inquire_nodes, my_team_id,
+            opp_player, mode, phase,
+        )
+        if guard_action is not None:
+            return guard_action
+
     # --- P2/P3: Task strategy (策略文档 §5) ---
     if not force_delivery:
         task_action = _handle_tasks(
@@ -581,15 +607,6 @@ def _decide_action_impl(
 
     # --- NAVIGATION: Move toward goal ---
     if force_delivery:
-        guard_action = _try_set_guard_action(
-            match_id, round_num, player_id, player, graph,
-            current_node_id, gate_node_id, terminal_node_ids,
-            weather, obstacle_nodes, inquire_nodes, my_team_id,
-            opp_player, mode, phase, force_delivery=True,
-        )
-        if guard_action is not None:
-            return guard_action
-
         move_action = _plan_force_delivery_move(
             match_id, round_num, player_id, player, graph,
             current_node_id, gate_node_id, terminal_node_ids,
@@ -2240,13 +2257,21 @@ def _find_squad_clear_target(
     return best_node or None
 
 
+def _list_own_active_guard_nodes(
+    inquire_nodes: list[dict], my_team_id: str, player_id: int,
+) -> list[str]:
+    nodes: list[str] = []
+    for node in inquire_nodes:
+        nid = node.get("nodeId", "")
+        if nid and is_own_guard(node.get("guard"), my_team_id, player_id):
+            nodes.append(nid)
+    return nodes
+
+
 def _count_own_active_guards(
     inquire_nodes: list[dict], my_team_id: str, player_id: int,
 ) -> int:
-    return sum(
-        1 for node in inquire_nodes
-        if is_own_guard(node.get("guard"), my_team_id, player_id)
-    )
+    return len(_list_own_active_guard_nodes(inquire_nodes, my_team_id, player_id))
 
 
 def _own_guard_active_at(
@@ -2267,6 +2292,68 @@ def _guard_extra_good_fruit(player: dict) -> int:
     return 0
 
 
+def _guard_good_fruit_sufficient(player: dict) -> bool:
+    extra = _guard_extra_good_fruit(player)
+    return get_good_fruit(player) >= 1 + extra + GUARD_GOOD_FRUIT_RESERVE
+
+
+def _evaluate_dual_guard_slot(
+    graph: MapGraph,
+    current_node_id: str,
+    goal: str,
+    weather: dict | None,
+    obstacle_nodes: set[str],
+    player: dict,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    player_id: int,
+    opp_player: dict,
+) -> tuple[bool, str]:
+    """Dual-guard plan: guard1 then guard2, each on opp path at a choke."""
+    own_guards = _list_own_active_guard_nodes(inquire_nodes, my_team_id, player_id)
+    if len(own_guards) >= MAX_ACTIVE_GUARDS:
+        return False, "max-guards"
+    if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
+        return False, "already-guarded"
+    if not _guard_good_fruit_sufficient(player):
+        return False, "low-fruit"
+    if not _is_key_choke_node(graph, current_node_id):
+        return False, "not-choke"
+
+    opp_node = opp_player.get("currentNodeId", "")
+    if not opp_node:
+        return False, "no-opp-node"
+
+    my_hops = graph.path_length(current_node_id, goal, weather, obstacle_nodes)
+    opp_hops = graph.path_length(opp_node, goal, weather, obstacle_nodes)
+    if my_hops == float("inf") or opp_hops == float("inf"):
+        return False, "unreachable"
+
+    opp_path = _path_nodes_to_goal(graph, opp_node, goal, weather, obstacle_nodes)
+    if current_node_id not in opp_path:
+        return False, "not-on-opp-path"
+
+    lead = opp_hops - my_hops
+    if lead < 1:
+        return False, "not-leading"
+
+    if len(own_guards) == 0:
+        if lead < GUARD_MIN_LEAD_FIRST:
+            return False, "guard1-insufficient-lead"
+        return True, f"guard1,ahead({int(lead)}),opp-path,choke"
+
+    first_node = own_guards[0]
+    if current_node_id == first_node:
+        return False, "guard2-same-node"
+    first_guard = _get_node_guard(inquire_nodes, first_node)
+    if not is_own_guard(first_guard, my_team_id, player_id):
+        return False, "guard1-lost"
+    if first_guard.get("defense", 0) <= 0:
+        return False, "guard1-not-active"
+
+    return True, f"guard2,after-{first_node},opp-path,choke"
+
+
 def _should_set_guard_dynamic(
     graph: MapGraph,
     current_node_id: str,
@@ -2281,27 +2368,26 @@ def _should_set_guard_dynamic(
     opp_player: dict | None,
     mode: str,
     phase: str,
-    *,
-    force_delivery: bool = False,
 ) -> tuple[bool, str]:
     """Decide whether to SET_GUARD at the fleet's current node."""
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
     if not goal or not current_node_id:
         return False, ""
 
-    if _count_own_active_guards(inquire_nodes, my_team_id, player_id) >= MAX_ACTIVE_GUARDS:
-        return False, "max-guards"
-    if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
-        return False, "already-guarded"
-
-    extra = _guard_extra_good_fruit(player)
-    if get_good_fruit(player) < 1 + extra + GUARD_GOOD_FRUIT_RESERVE:
-        return False, "low-fruit"
-
     if phase == "RUSH" and gate_node_id and current_node_id == gate_node_id:
+        if not _guard_good_fruit_sufficient(player):
+            return False, "low-fruit"
+        if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
+            return False, "already-guarded"
         return True, "rush-gate"
 
     if mode == "GATE_FIGHT":
+        if _count_own_active_guards(inquire_nodes, my_team_id, player_id) >= MAX_ACTIVE_GUARDS:
+            return False, "max-guards"
+        if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
+            return False, "already-guarded"
+        if not _guard_good_fruit_sufficient(player):
+            return False, "low-fruit"
         if _is_key_choke_node(graph, current_node_id):
             return True, "gate-fight-choke"
         if gate_node_id and current_node_id == gate_node_id:
@@ -2310,36 +2396,54 @@ def _should_set_guard_dynamic(
 
     if not opp_player:
         return False, "no-opp"
-    opp_node = opp_player.get("currentNodeId", "")
-    if not opp_node:
-        return False, "no-opp-node"
 
-    my_hops = graph.path_length(current_node_id, goal, weather, obstacle_nodes)
-    opp_hops = graph.path_length(opp_node, goal, weather, obstacle_nodes)
-    if my_hops == float("inf") or opp_hops == float("inf"):
-        return False, "unreachable"
-    if opp_hops <= my_hops:
-        return False, "not-leading"
+    return _evaluate_dual_guard_slot(
+        graph, current_node_id, goal, weather, obstacle_nodes,
+        player, inquire_nodes, my_team_id, player_id, opp_player,
+    )
 
-    opp_path = _path_nodes_to_goal(graph, opp_node, goal, weather, obstacle_nodes)
-    if current_node_id not in opp_path:
-        return False, "not-on-opp-path"
 
-    my_path = _path_nodes_to_goal(graph, current_node_id, goal, weather, obstacle_nodes)
-    if current_node_id in my_path:
-        if not _is_key_choke_node(graph, current_node_id):
-            return False, "on-my-path-not-choke"
-        lead = opp_hops - my_hops
-        if lead < 2:
-            return False, "on-my-path-insufficient-lead"
+def _try_leave_own_guard_node(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    route_blocked: set[str],
+    avoid_route_nodes: set[str],
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    own_guard_sites: set[str],
+) -> dict | None:
+    """After SET_GUARD, leave the node via detour so we do not block ourselves."""
+    if not current_node_id or current_node_id not in own_guard_sites:
+        return None
 
-    lead = int(opp_hops - my_hops)
-    reason = f"ahead({lead}),opp-path"
-    if _is_key_choke_node(graph, current_node_id):
-        reason += ",choke"
-    if force_delivery:
-        reason += ",force-delivery"
-    return True, reason
+    detour = _find_delivery_detour_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids, route_blocked,
+        avoid_nodes=avoid_route_nodes,
+    )
+    if detour:
+        logger.info(
+            "Round %d: leaving own guard at %s via %s (guard/advance split)",
+            round_num, current_node_id, detour,
+        )
+        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+
+    for neighbor in graph.get_neighbors(current_node_id):
+        if neighbor in avoid_route_nodes:
+            continue
+        logger.info(
+            "Round %d: leaving own guard at %s via %s (fallback)",
+            round_num, current_node_id, neighbor,
+        )
+        return make_action(match_id, round_num, player_id, [make_move_action(neighbor)])
+    return None
 
 
 def _try_set_guard_action(
@@ -2349,13 +2453,11 @@ def _try_set_guard_action(
     weather: dict | None, obstacle_nodes: set[str],
     inquire_nodes: list[dict], my_team_id: str,
     opp_player: dict | None, mode: str, phase: str,
-    *, force_delivery: bool = False,
 ) -> dict | None:
     should, reason = _should_set_guard_dynamic(
         graph, current_node_id, gate_node_id, terminal_node_ids,
         weather, obstacle_nodes, player, inquire_nodes,
         my_team_id, player_id, opp_player, mode, phase,
-        force_delivery=force_delivery,
     )
     if not should:
         return None
@@ -2396,16 +2498,6 @@ def _handle_combat(
         squad_clear_pending = set()
     if not my_team_id:
         my_team_id = get_team_id(player)
-
-    # --- SET_GUARD: dynamic choke / opp-path / lead-based ---
-    guard_action = _try_set_guard_action(
-        match_id, round_num, player_id, player, graph,
-        current_node_id, gate_node_id, terminal_node_ids,
-        weather, obstacle_nodes, inquire_nodes, my_team_id,
-        opp_player, mode, phase,
-    )
-    if guard_action is not None:
-        return guard_action
 
     # --- BREAK_GUARD with optional BREAK_ORDER (策略文档 §8.2, §10) ---
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
