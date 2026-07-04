@@ -30,6 +30,8 @@ from lychee_client.state import (
     RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY, MAX_ROUND,
     SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
     MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE,
+    GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
+    FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
 )
 from lychee_client.decision import (
     make_action, make_move_action, make_wait_action,
@@ -113,6 +115,8 @@ def decide_action(
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
     squad_clear_pending: set[str] | None = None,
+    guard_stuck_rounds: int = 0,
+    guard_stuck_target: str = "",
 ) -> dict:
     """Decide the action for the current round.
 
@@ -155,6 +159,7 @@ def decide_action(
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
             forced_pass_failed_targets, squad_clear_pending,
+            guard_stuck_rounds, guard_stuck_target,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -192,6 +197,8 @@ def _decide_action_impl(
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
     squad_clear_pending: set[str] | None = None,
+    guard_stuck_rounds: int = 0,
+    guard_stuck_target: str = "",
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -239,6 +246,19 @@ def _decide_action_impl(
         gate_node_id, terminal_node_ids, weather,
         process_nodes, processed_node_ids,
     )
+    guard_wait_kwargs = {
+        "force_delivery": force_delivery,
+        "graph": graph,
+        "gate_node_id": gate_node_id,
+        "terminal_node_ids": terminal_node_ids,
+        "weather": weather,
+        "route_blocked": route_blocked,
+        "avoid_route_nodes": avoid_route_nodes,
+        "guard_stuck_rounds": guard_stuck_rounds,
+        "guard_stuck_target": guard_stuck_target,
+        "process_nodes": process_nodes,
+        "processed_node_ids": processed_node_ids,
+    }
 
     if is_in_limited_state(player):
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
@@ -295,36 +315,17 @@ def _decide_action_impl(
                     return task_retry
 
             if force_delivery and current_node_id and not next_node:
-                direct_target = _find_direct_delivery_step(
-                    graph, current_node_id, player, gate_node_id, terminal_node_ids,
+                move_action = _plan_force_delivery_move(
+                    match_id, round_num, player_id, player, graph,
+                    current_node_id, gate_node_id, terminal_node_ids,
                     weather, process_nodes, processed_node_ids,
-                    avoid_nodes=avoid_route_nodes,
+                    route_blocked, avoid_route_nodes, guard_stuck_rounds, guard_stuck_target,
+                    inquire_nodes, tasks, failed_task_ids, obstacle_nodes, my_team_id,
+                    forced_pass_failed_targets, last_move_failed, last_move_error,
+                    log_prefix="FORCE_DELIVERY",
                 )
-                if direct_target:
-                    if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        blocker_action = _handle_force_delivery_blocker(
-                            match_id, round_num, player_id, player,
-                            direct_target, inquire_nodes, tasks, failed_task_ids,
-                            obstacle_nodes, my_team_id,
-                        )
-                        if blocker_action.get("msg_data", {}).get("actions"):
-                            return blocker_action
-                    hop_action = _resolve_guarded_delivery_hop(
-                        match_id, round_num, player_id, player,
-                        current_node_id, direct_target, forced_pass_failed_targets,
-                        inquire_nodes, tasks, failed_task_ids, obstacle_nodes,
-                        my_team_id, route_blocked,
-                    )
-                    if hop_action is not None:
-                        return hop_action
-                    horse_action = _use_horse_before_expensive_hop(
-                        match_id, round_num, player_id, player, graph,
-                        current_node_id, direct_target, weather, process_nodes,
-                    )
-                    if horse_action is not None:
-                        return horse_action
-                    logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
-                    return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
+                if move_action is not None:
+                    return move_action
 
             if guard_target:
                 if force_delivery:
@@ -338,6 +339,7 @@ def _decide_action_impl(
                 return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, guard_target, my_team_id,
+                    **guard_wait_kwargs,
                 )
 
             if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
@@ -357,6 +359,7 @@ def _decide_action_impl(
                     return _wait_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, next_node, my_team_id,
+                        **guard_wait_kwargs,
                     )
                 return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
             if current_node_id:
@@ -372,6 +375,7 @@ def _decide_action_impl(
                     return _wait_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, move_target, my_team_id,
+                        **guard_wait_kwargs,
                     )
 
         if state == "MOVING":
@@ -388,6 +392,7 @@ def _decide_action_impl(
                 return _wait_and_weaken_guard(
                     match_id, round_num, player_id, player,
                     inquire_nodes, target, my_team_id,
+                    **guard_wait_kwargs,
                 )
             moving_action = _handle_moving(match_id, round_num, player_id, player, graph, weather, phase)
             if moving_action.get("msg_data", {}).get("actions"):
@@ -585,36 +590,16 @@ def _decide_action_impl(
         if guard_action is not None:
             return guard_action
 
-        direct_target = _find_direct_delivery_step(
-            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        move_action = _plan_force_delivery_move(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
             weather, process_nodes, processed_node_ids,
-            avoid_nodes=avoid_route_nodes,
+            route_blocked, avoid_route_nodes, guard_stuck_rounds, guard_stuck_target,
+            inquire_nodes, tasks, failed_task_ids, obstacle_nodes, my_team_id,
+            forced_pass_failed_targets, last_move_failed, last_move_error,
         )
-        if direct_target:
-            if direct_target in route_blocked or direct_target in obstacle_nodes:
-                blocker_action = _handle_force_delivery_blocker(
-                    match_id, round_num, player_id, player,
-                    direct_target, inquire_nodes, tasks, failed_task_ids,
-                    obstacle_nodes, my_team_id,
-                )
-                if blocker_action.get("msg_data", {}).get("actions"):
-                    return blocker_action
-            hop_action = _resolve_guarded_delivery_hop(
-                match_id, round_num, player_id, player,
-                current_node_id, direct_target, forced_pass_failed_targets,
-                inquire_nodes, tasks, failed_task_ids, obstacle_nodes,
-                my_team_id, route_blocked,
-            )
-            if hop_action is not None:
-                return hop_action
-            horse_action = _use_horse_before_expensive_hop(
-                match_id, round_num, player_id, player, graph,
-                current_node_id, direct_target, weather, process_nodes,
-            )
-            if horse_action is not None:
-                return horse_action
-            logger.info("Round %d: FORCE_DELIVERY move to %s (goal=%s)", round_num, direct_target, gate_node_id)
-            return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
+        if move_action is not None:
+            return move_action
 
     move_target = _find_move_target(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
@@ -857,11 +842,14 @@ def _should_force_delivery(
         graph, current_node_id, player, gate_node_id,
         terminal_node_ids or [], weather, process_nodes, processed_node_ids,
     )
-    buffer = 12.0
+    buffer = FORCE_DELIVERY_ETA_BUFFER
+
+    if remaining > FORCE_DELIVERY_MIN_REMAINING and task_score < 60:
+        return eta >= remaining - 8
 
     if eta >= remaining - buffer:
         return True
-    if task_score >= 60 and eta >= (remaining - buffer) * 0.8:
+    if task_score >= 60 and eta >= (remaining - buffer) * 0.85:
         return True
     if remaining <= int(max_round * 0.33):
         return True
@@ -930,6 +918,177 @@ def _find_direct_delivery_step(
     return graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
 
 
+def _find_delivery_detour_step(
+    graph: MapGraph,
+    current_node_id: str,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    route_blocked: set[str],
+    avoid_nodes: set[str] | None = None,
+) -> str | None:
+    """Pick an unblocked neighbor that still reaches the delivery goal."""
+    if avoid_nodes is None:
+        avoid_nodes = set()
+    goal_node = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, route_blocked, process_nodes,
+    )
+    if not goal_node:
+        return None
+
+    remaining_process_nodes = None
+    if process_nodes:
+        remaining_process_nodes = {
+            nid: info for nid, info in process_nodes.items()
+            if nid not in processed_node_ids
+        }
+
+    routing_blocked = set(route_blocked) | set(avoid_nodes)
+    best_step = None
+    best_cost = float("inf")
+    for neighbor in graph.get_neighbors(current_node_id):
+        if neighbor in avoid_nodes:
+            continue
+        path = graph.weighted_shortest_path(
+            neighbor, goal_node, weather, routing_blocked, remaining_process_nodes,
+        )
+        if not path:
+            continue
+        hop_cost = graph.edge_cost(
+            current_node_id, neighbor, weather, routing_blocked, remaining_process_nodes,
+        )
+        tail_cost = sum(
+            graph.edge_cost(path[i], path[i + 1], weather, routing_blocked, remaining_process_nodes)
+            for i in range(len(path) - 1)
+        )
+        total = hop_cost + tail_cost
+        if total < best_cost:
+            best_cost = total
+            best_step = neighbor
+    return best_step
+
+
+def _should_detour_force_delivery(
+    direct_target: str,
+    route_blocked: set[str],
+    avoid_route_nodes: set[str],
+    guard_stuck_rounds: int,
+    guard_stuck_target: str,
+) -> bool:
+    if not direct_target:
+        return False
+    if direct_target in avoid_route_nodes:
+        return True
+    if guard_stuck_target and direct_target == guard_stuck_target:
+        if guard_stuck_rounds >= GUARD_SILENT_WAIT_LIMIT:
+            return True
+    if direct_target in route_blocked and guard_stuck_rounds >= GUARD_SILENT_WAIT_LIMIT:
+        return True
+    return False
+
+
+def _plan_force_delivery_move(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    route_blocked: set[str],
+    avoid_route_nodes: set[str],
+    guard_stuck_rounds: int,
+    guard_stuck_target: str,
+    inquire_nodes: list[dict],
+    tasks: list[dict],
+    failed_task_ids: set[str],
+    obstacle_nodes: set[str],
+    my_team_id: str,
+    forced_pass_failed_targets: set[str],
+    last_move_failed: bool,
+    last_move_error: str,
+    *,
+    log_prefix: str = "FORCE_DELIVERY",
+) -> dict | None:
+    """Resolve the next force-delivery hop, including detour and guard handling."""
+    direct_target = _find_direct_delivery_step(
+        graph, current_node_id, player, gate_node_id, terminal_node_ids,
+        weather, process_nodes, processed_node_ids,
+        avoid_nodes=avoid_route_nodes,
+    )
+    target = direct_target
+    detour = False
+
+    if _should_detour_force_delivery(
+        direct_target or "", route_blocked, avoid_route_nodes,
+        guard_stuck_rounds, guard_stuck_target,
+    ):
+        alt = _find_delivery_detour_step(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+            weather, process_nodes, processed_node_ids, route_blocked,
+            avoid_nodes=avoid_route_nodes | ({direct_target} if direct_target else set()),
+        )
+        if alt:
+            logger.info(
+                "Round %d: %s detour via %s (avoid %s, stuck=%d)",
+                round_num, log_prefix, alt, direct_target or guard_stuck_target, guard_stuck_rounds,
+            )
+            target = alt
+            detour = True
+
+    if not target:
+        alt = _find_delivery_detour_step(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+            weather, process_nodes, processed_node_ids, route_blocked,
+            avoid_nodes=avoid_route_nodes,
+        )
+        if alt:
+            logger.info("Round %d: %s fallback detour via %s", round_num, log_prefix, alt)
+            target = alt
+            detour = True
+
+    if not target:
+        return None
+
+    if not detour:
+        if target in route_blocked or target in obstacle_nodes:
+            blocker_action = _handle_force_delivery_blocker(
+                match_id, round_num, player_id, player,
+                target, inquire_nodes, tasks, failed_task_ids,
+                obstacle_nodes, my_team_id,
+            )
+            if blocker_action.get("msg_data", {}).get("actions"):
+                return blocker_action
+        hop_action = _resolve_guarded_delivery_hop(
+            match_id, round_num, player_id, player,
+            current_node_id, target, forced_pass_failed_targets,
+            inquire_nodes, tasks, failed_task_ids, obstacle_nodes,
+            my_team_id, route_blocked,
+            last_move_failed=last_move_failed,
+            last_move_error=last_move_error,
+        )
+        if hop_action is not None:
+            return hop_action
+
+    horse_action = _use_horse_before_expensive_hop(
+        match_id, round_num, player_id, player, graph,
+        current_node_id, target, weather, process_nodes,
+    )
+    if horse_action is not None:
+        return horse_action
+
+    logger.info("Round %d: %s move to %s (goal=%s)%s", round_num, log_prefix, target, gate_node_id, " detour" if detour else "")
+    return make_action(match_id, round_num, player_id, [make_move_action(target)])
+
+
 def _handle_force_delivery_blocker(
     match_id: str,
     round_num: int,
@@ -942,6 +1101,17 @@ def _handle_force_delivery_blocker(
     obstacle_nodes: set[str],
     my_team_id: str,
 ) -> dict:
+    guard = _get_node_guard(inquire_nodes, target_node_id)
+    if is_enemy_guard(guard, my_team_id, player_id):
+        good = min(get_good_fruit(player), 2)
+        bad = min(get_bad_fruit(player), 2)
+        if good + bad > 0:
+            action = make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
+            logger.info("Round %d: FORCE_DELIVERY break guard at %s", round_num, target_node_id)
+            return make_action(match_id, round_num, player_id, [action])
+        logger.info("Round %d: FORCE_DELIVERY forced pass guard at %s", round_num, target_node_id)
+        return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+
     if target_node_id in obstacle_nodes:
         t04_task = None
         for task in tasks:
@@ -964,20 +1134,6 @@ def _handle_force_delivery_blocker(
         logger.info("Round %d: FORCE_DELIVERY forced pass obstacle at %s", round_num, target_node_id)
         return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
-    for node in inquire_nodes:
-        if node.get("nodeId") != target_node_id:
-            continue
-        guard = node.get("guard", {})
-        if is_enemy_guard(guard, my_team_id, player_id):
-            good = min(get_good_fruit(player), 2)
-            bad = min(get_bad_fruit(player), 2)
-            if good + bad > 0:
-                action = make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
-                logger.info("Round %d: FORCE_DELIVERY break guard at %s", round_num, target_node_id)
-                return make_action(match_id, round_num, player_id, [action])
-            logger.info("Round %d: FORCE_DELIVERY forced pass guard at %s", round_num, target_node_id)
-            return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
-
     logger.info("Round %d: FORCE_DELIVERY forced pass blocked %s", round_num, target_node_id)
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
@@ -996,8 +1152,17 @@ def _resolve_guarded_delivery_hop(
     obstacle_nodes: set[str],
     my_team_id: str,
     route_blocked: set[str],
+    last_move_failed: bool = False,
+    last_move_error: str = "",
 ) -> dict | None:
     """Resolve a guarded/obstructed delivery hop using live state, not fixed timers."""
+    if last_move_failed and last_move_error == "OBJECT_BUSY":
+        logger.info(
+            "Round %d: guard setup window at %s, waiting (no FORCED_PASS retry)",
+            round_num, target_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
+
     if target_node_id in obstacle_nodes:
         return _handle_force_delivery_blocker(
             match_id, round_num, player_id, player,
@@ -1433,8 +1598,64 @@ def _wait_and_weaken_guard(
     inquire_nodes: list[dict],
     target_node_id: str,
     my_team_id: str,
+    *,
+    force_delivery: bool = False,
+    graph: MapGraph | None = None,
+    gate_node_id: str = "",
+    terminal_node_ids: list[str] | None = None,
+    weather: dict | None = None,
+    route_blocked: set[str] | None = None,
+    avoid_route_nodes: set[str] | None = None,
+    guard_stuck_rounds: int = 0,
+    guard_stuck_target: str = "",
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
 ) -> dict:
     """WAIT (主车队) + SQUAD_WEAKEN (小分队) 每帧削弱设卡直到通行。"""
+    if route_blocked is None:
+        route_blocked = set()
+    if avoid_route_nodes is None:
+        avoid_route_nodes = set()
+    if processed_node_ids is None:
+        processed_node_ids = set()
+    if terminal_node_ids is None:
+        terminal_node_ids = []
+
+    guard = _get_node_guard(inquire_nodes, target_node_id)
+    if not is_enemy_guard(guard, my_team_id, player_id):
+        if force_delivery and graph and get_current_node_id(player):
+            detour = _find_delivery_detour_step(
+                graph, get_current_node_id(player), player, gate_node_id,
+                terminal_node_ids, weather, process_nodes, processed_node_ids,
+                route_blocked, avoid_nodes=avoid_route_nodes | {target_node_id},
+            )
+            if detour:
+                logger.info(
+                    "Round %d: guard cleared/absent at %s, detour via %s",
+                    round_num, target_node_id, detour,
+                )
+                return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+
+    if (
+        force_delivery
+        and graph
+        and _should_detour_force_delivery(
+            target_node_id, route_blocked, avoid_route_nodes,
+            guard_stuck_rounds, guard_stuck_target,
+        )
+    ):
+        detour = _find_delivery_detour_step(
+            graph, get_current_node_id(player) or "", player, gate_node_id,
+            terminal_node_ids, weather, process_nodes, processed_node_ids,
+            route_blocked, avoid_nodes=avoid_route_nodes | {target_node_id},
+        )
+        if detour:
+            logger.info(
+                "Round %d: stuck %d rounds on %s, detour via %s",
+                round_num, guard_stuck_rounds, target_node_id, detour,
+            )
+            return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+
     msg = make_action(match_id, round_num, player_id, [make_wait_action()])
     squad = _make_squad_weaken_action(
         inquire_nodes, target_node_id, my_team_id, player_id, player,
@@ -1442,6 +1663,10 @@ def _wait_and_weaken_guard(
     if squad:
         logger.info("Round %d: WAIT + squad weaken at %s", round_num, target_node_id)
         return _append_squad_action(msg, squad)
+    logger.info(
+        "Round %d: WAIT at blocked %s (stuck=%d, no weaken)",
+        round_num, target_node_id, guard_stuck_rounds,
+    )
     return msg
 
 
@@ -1618,6 +1843,12 @@ def _handle_tasks(
     ):
         return None
 
+    hops_to_goal = float("inf")
+    goal = goal_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
+    if goal and graph and current_node_id:
+        hops_to_goal = graph.path_length(current_node_id, goal, weather, blocked)
+    push_phase = my_task_score < 40 and hops_to_goal > 5
+
     # Already at stretch target, don't need more tasks
     if my_task_score >= TASK_SCORE_STRETCH and phase != "RUSH":
         return None
@@ -1637,6 +1868,8 @@ def _handle_tasks(
     )
     if task:
         template_id = get_task_template_id(task)
+        if push_phase and not template_id.startswith(("T01", "T06", "T04")):
+            task = None
         if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
             logger.debug("Round %d: Skipping T06 task (no horse)", round_num)
             task = None
@@ -1664,7 +1897,7 @@ def _handle_tasks(
             ])
 
     # Look for nearby tasks within detour cost (策略文档 §5.2 顺路原则)
-    if my_task_score < TASK_SCORE_TARGET:
+    if my_task_score < TASK_SCORE_TARGET and not push_phase:
         candidates = []
         for task in tasks:
             if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
@@ -1861,18 +2094,21 @@ def _handle_use_resources(
 ) -> dict | None:
     """Handle using resources: ice box, horses (策略文档 §6.1)."""
     freshness = get_freshness(player)
-
-    if has_resource(player, "ICE_BOX") and freshness <= ICE_BOX_FRESHNESS_THRESHOLD:
-        logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
-        return make_action(match_id, round_num, player_id, [
-            make_use_resource_action("ICE_BOX")
-        ])
-
     force_delivery = _should_force_delivery(
         round_num, phase, player, graph, current_node_id,
         gate_node_id, terminal_node_ids, weather,
         process_nodes, processed_node_ids,
     )
+    ice_threshold = ICE_BOX_FRESHNESS_THRESHOLD
+    if force_delivery:
+        ice_threshold = ICE_BOX_FRESHNESS_THRESHOLD + 8
+
+    if has_resource(player, "ICE_BOX") and freshness <= ice_threshold:
+        logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("ICE_BOX")
+        ])
+
     if force_delivery:
         direct_target = _find_direct_delivery_step(
             graph, current_node_id, player, gate_node_id,

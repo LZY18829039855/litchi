@@ -10,7 +10,7 @@ from typing import Any
 from lychee_client.transport import encode_frame, read_frames_from_buffer
 from lychee_client.messages import parse_message, StartMessage, InquireMessage, OverMessage
 from lychee_client.map_graph import MapGraph
-from lychee_client.state import can_move, get_current_node_id, needs_processing
+from lychee_client.state import can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
 
@@ -213,6 +213,27 @@ class GameClient:
                     self.guard_blocked_targets.discard(nid)
                     self.avoid_route_nodes.discard(nid)
                     logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
+                elif current_node_id and self.graph and nid in self.graph.get_neighbors(current_node_id):
+                    self.guard_blocked_targets.add(nid)
+
+        if current_node_id and self.graph:
+            for node in inquire.nodes:
+                nid = node.get("nodeId", "")
+                if not nid or nid not in self.graph.get_neighbors(current_node_id):
+                    continue
+                guard = node.get("guard", {}) or {}
+                owner_team = guard.get("ownerTeamId") or guard.get("teamId", "")
+                owner_player = guard.get("playerId")
+                is_enemy_active = (
+                    guard.get("active", True) is not False
+                    and guard.get("defense", 0) > 0
+                    and (
+                        (owner_team and owner_team != player.get("teamId", ""))
+                        or (owner_player is not None and owner_player != self.player_id)
+                    )
+                )
+                if is_enemy_active:
+                    self.guard_blocked_targets.add(nid)
 
         # Check last action result
         last_failed = False
@@ -375,26 +396,36 @@ class GameClient:
                     self.active_contest_id = ""
                     logger.info("Round %d: Window contest ended: %s", inquire.round, cid)
 
-        # Track how long we are stuck waiting on a guarded edge
+        # Track how long we are stuck on a guarded hop (next hop or blocked neighbor)
         player_state = player.get("state", "")
         next_nid = player.get("nextNodeId", "")
+        stuck_block = ""
+        if next_nid and next_nid in self.guard_blocked_targets:
+            stuck_block = next_nid
+        elif current_node_id and self.graph:
+            for tgt in self.guard_blocked_targets:
+                if tgt in self.avoid_route_nodes:
+                    continue
+                if tgt in self.graph.get_neighbors(current_node_id):
+                    stuck_block = tgt
+                    break
         if (
-            player_state in ("WAITING", "MOVING")
-            and next_nid
-            and (next_nid in self.guard_blocked_targets or next_nid in self.avoid_route_nodes)
+            player_state in ("WAITING", "MOVING", "IDLE")
+            and stuck_block
         ):
-            if next_nid == self.guard_stuck_target:
+            if stuck_block == self.guard_stuck_target and current_node_id == self.last_node_id:
                 self.guard_stuck_rounds += 1
             else:
-                self.guard_stuck_target = next_nid
+                self.guard_stuck_target = stuck_block
                 self.guard_stuck_rounds = 1
-            if self.guard_stuck_rounds >= 20:
-                self.avoid_route_nodes.add(next_nid)
+            if self.guard_stuck_rounds >= GUARD_STUCK_AVOID_ROUNDS:
+                self.avoid_route_nodes.add(stuck_block)
+                self.guard_blocked_targets.discard(stuck_block)
                 logger.info(
                     "Round %d: Permanently avoiding %s after %d stuck rounds",
-                    inquire.round, next_nid, self.guard_stuck_rounds,
+                    inquire.round, stuck_block, self.guard_stuck_rounds,
                 )
-        else:
+        elif not stuck_block:
             self.guard_stuck_target = ""
             self.guard_stuck_rounds = 0
 
@@ -447,6 +478,8 @@ class GameClient:
             pending_task_hold_until_round=self.pending_task_hold_until_round,
             forced_pass_failed_targets=self.forced_pass_failed_targets,
             squad_clear_pending=self.squad_clear_pending,
+            guard_stuck_rounds=self.guard_stuck_rounds,
+            guard_stuck_target=self.guard_stuck_target,
         )
 
         self.send_message(action_msg)
