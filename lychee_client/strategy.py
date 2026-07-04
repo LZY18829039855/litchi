@@ -39,7 +39,8 @@ from lychee_client.state import (
     GUARD_RESERVE_FOR_GATE, FINAL_CORRIDOR_GATE_HOPS,
     FINAL_CORRIDOR_GUARD_MIN_LEAD, FINAL_CORRIDOR_GUARD_TASK_MIN,
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
-    FORCE_DELIVERY_ETA_REMAINING_MAX,
+    FORCE_DELIVERY_ETA_REMAINING_MAX, FORCE_DELIVERY_LATE_REMAINING,
+    RUSH_TASK_DETOUR_BONUS,
 )
 from lychee_client.decision import (
     make_action, make_move_action, make_wait_action,
@@ -271,6 +272,11 @@ def _decide_action_impl(
         "processed_node_ids": processed_node_ids,
     }
 
+    if state != "CONTESTING" and not is_in_passive_state(player):
+        ice_use = _try_use_ice_box(match_id, round_num, player_id, player)
+        if ice_use is not None:
+            return ice_use
+
     if state == "CONTESTING":
         on_water_route = _is_on_water_route(graph, current_node_id, gate_node_id, terminal_node_ids)
         return _handle_contesting(
@@ -418,6 +424,12 @@ def _decide_action_impl(
     if current_node_id is None:
         return make_empty_action(match_id, round_num, player_id)
 
+    ice_claim = _try_claim_ice_box(
+        match_id, round_num, player_id, player, current_node,
+    )
+    if ice_claim is not None:
+        return ice_claim
+
     if (
         not force_delivery
         and pending_task_hold_node_id == current_node_id
@@ -550,8 +562,8 @@ def _decide_action_impl(
         if guard_action is not None:
             return guard_action
 
-    # --- P2/P3: Task strategy (策略文档 §5) — keep collecting until task_score ≥ 90 ---
-    if not force_delivery or get_task_score(player) < TASK_SCORE_TARGET:
+    # --- P2/P3: Task strategy — collect until stretch (110); RUSH 较早仍可做任务 ---
+    if get_task_score(player) < TASK_SCORE_STRETCH:
         task_action = _handle_tasks(
             match_id, round_num, player_id, player, graph,
             current_node_id, tasks, player_id, phase, weather, blocked,
@@ -935,23 +947,21 @@ def _should_force_delivery(
     processed_node_ids: set[str] | None = None,
     max_round: int = MAX_ROUND,
 ) -> bool:
-    """Stop optional scoring when remaining time is tight for delivery ETA."""
-    if phase == "RUSH":
-        return True
+    """Force delivery only when time is tight or task stretch is reached.
 
+    RUSH 触发较早，不因 phase=RUSH 或 task≥90 立刻放弃做任务；
+    以 ETA 估算和剩余帧数决定是否必须冲刺交付。
+    """
     task_score = get_task_score(player)
-    if task_score >= TASK_SCORE_TARGET:
-        return True
-
     remaining = max(0, max_round - round_num)
     if remaining <= 0:
         return True
 
-    if remaining <= int(max_round * 0.33):
+    if task_score >= TASK_SCORE_STRETCH:
         return True
 
     if graph is None or not current_node_id:
-        return False
+        return remaining <= FORCE_DELIVERY_LATE_REMAINING and task_score >= TASK_SCORE_TARGET
 
     if task_score < 60:
         return False
@@ -962,8 +972,12 @@ def _should_force_delivery(
     )
     buffer = FORCE_DELIVERY_ETA_BUFFER
 
-    if remaining <= FORCE_DELIVERY_ETA_REMAINING_MAX and eta >= remaining - buffer:
+    if eta != float("inf") and eta >= remaining - buffer:
         return True
+
+    if remaining <= FORCE_DELIVERY_LATE_REMAINING and task_score >= TASK_SCORE_TARGET:
+        return True
+
     return False
 
 
@@ -1373,12 +1387,10 @@ def _use_horse_before_expensive_hop(
 
 
 def _should_use_task_aware_routing(player: dict, phase: str, force_delivery: bool) -> bool:
-    if force_delivery:
-        return False
     my_task_score = get_task_score(player)
-    if my_task_score >= TASK_SCORE_TARGET:
+    if my_task_score >= TASK_SCORE_STRETCH:
         return False
-    if phase == "RUSH" and my_task_score >= 60:
+    if force_delivery and my_task_score >= TASK_SCORE_TARGET:
         return False
     return True
 
@@ -2247,7 +2259,7 @@ def _retry_task_at_current_node(
 ) -> dict | None:
     if enemy_busy_task_ids is None:
         enemy_busy_task_ids = set()
-    if get_task_score(player) >= TASK_SCORE_TARGET:
+    if get_task_score(player) >= TASK_SCORE_STRETCH:
         return None
     if isinstance(player.get("currentProcess"), dict):
         return None
@@ -2327,14 +2339,17 @@ def _handle_tasks(
         enemy_busy_task_ids = set()
 
     my_task_score = get_task_score(player)
-    if my_task_score >= TASK_SCORE_STRETCH and phase != "RUSH":
+    if my_task_score >= TASK_SCORE_STRETCH:
         return None
 
     hops_to_goal = float("inf")
     goal = goal_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
     if goal and graph and current_node_id:
         hops_to_goal = graph.path_length(current_node_id, goal, weather, blocked)
-    push_phase = my_task_score < 40 and hops_to_goal > 5
+    push_phase = my_task_score < 40 and hops_to_goal > 5 and phase != "RUSH"
+    max_task_detour = MAX_TASK_DETOUR_COST
+    if phase == "RUSH" and my_task_score < TASK_SCORE_STRETCH:
+        max_task_detour += RUSH_TASK_DETOUR_BONUS
 
     if _player_processing_task(player):
         return None
@@ -2389,7 +2404,7 @@ def _handle_tasks(
             ])
 
     # Look for nearby tasks within detour cost (策略文档 §5.2 顺路原则)
-    if my_task_score < TASK_SCORE_TARGET and not push_phase:
+    if my_task_score < TASK_SCORE_STRETCH and not push_phase:
         candidates = []
         for task in tasks:
             if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
@@ -2426,7 +2441,7 @@ def _handle_tasks(
 
             # Check detour cost
             detour = _calc_detour_cost(graph, current_node_id, task_node, goal_node_id, terminal_node_ids, weather, blocked, player, process_nodes)
-            if detour <= MAX_TASK_DETOUR_COST:
+            if detour <= max_task_detour:
                 # Score per round priority (策略文档 §5.1)
                 spr = 0.0
                 for prefix, (score, proc_round, score_per_round) in TASK_PRIORITY.items():
@@ -2490,6 +2505,38 @@ def _calc_detour_cost(
     return int((via_task - direct) / 1000)
 
 
+def _try_use_ice_box(
+    match_id: str, round_num: int, player_id: int, player: dict,
+) -> dict | None:
+    """鲜度 < 90 时立即使用冰鉴，无其他条件。"""
+    if not has_resource(player, "ICE_BOX"):
+        return None
+    freshness = get_freshness(player)
+    if freshness >= ICE_BOX_FRESHNESS_THRESHOLD:
+        return None
+    logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
+    return make_action(match_id, round_num, player_id, [
+        make_use_resource_action("ICE_BOX")
+    ])
+
+
+def _try_claim_ice_box(
+    match_id: str, round_num: int, player_id: int,
+    player: dict, current_node: dict | None,
+) -> dict | None:
+    """路途中遇到冰鉴就领取，不受距宫门距离等限制。"""
+    if current_node is None or has_resource(player, "ICE_BOX"):
+        return None
+    current_node_id = current_node.get("nodeId", "")
+    for rtype, _count in find_available_resources(current_node):
+        if rtype == "ICE_BOX":
+            logger.info("Round %d: Claiming ICE_BOX at %s", round_num, current_node_id)
+            return make_action(match_id, round_num, player_id, [
+                make_claim_resource_action(current_node_id, rtype)
+            ])
+    return None
+
+
 def _handle_resources(
     match_id: str, round_num: int, player_id: int,
     player: dict, graph: MapGraph, current_node_id: str,
@@ -2503,7 +2550,9 @@ def _handle_resources(
     """
     if current_node is None:
         return None
-    if phase == "RUSH" or round_num >= 360:
+    if phase == "RUSH" and get_task_score(player) >= TASK_SCORE_STRETCH:
+        return None
+    if round_num >= 520:
         return None
 
     hops_to_gate = _hops_to_gate(graph, current_node_id, gate_node_id, weather, None)
@@ -2623,22 +2672,12 @@ def _handle_use_resources(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
 ) -> dict | None:
-    """Handle using resources: ice box, horses (策略文档 §6.1)."""
-    freshness = get_freshness(player)
+    """Handle using resources: horses (冰鉴由 _try_use_ice_box 优先处理)."""
     force_delivery = _should_force_delivery(
         round_num, phase, player, graph, current_node_id,
         gate_node_id, terminal_node_ids, weather,
         process_nodes, processed_node_ids,
     )
-    ice_threshold = ICE_BOX_FRESHNESS_THRESHOLD
-    if force_delivery:
-        ice_threshold = ICE_BOX_FRESHNESS_THRESHOLD + 8
-
-    if has_resource(player, "ICE_BOX") and freshness <= ice_threshold:
-        logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
-        return make_action(match_id, round_num, player_id, [
-            make_use_resource_action("ICE_BOX")
-        ])
 
     if force_delivery:
         direct_target = _find_direct_delivery_step(
