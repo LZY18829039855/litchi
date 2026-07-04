@@ -24,8 +24,12 @@ from lychee_client.state import (
     get_player_resources, has_resource, get_squad_count,
     get_action_points, get_task_score, get_blocked_nodes,
     classify_opponent_mode, get_team_id, get_task_template_id,
+    is_task_available, get_task_point_value,
     is_verify_process, is_enemy_guard, is_own_guard, guard_is_active, node_has_obstacle,
     TASK_SCORE_TARGET, TASK_SCORE_STRETCH, MAX_TASK_DETOUR_COST,
+    ROUTE_TASK_BONUS_PER_SCORE, ROUTE_VISITED_BACKTRACK_PENALTY,
+    ROUTE_BUCKET_BONUS_PER_SCORE, NEAR_GATE_RESOURCE_HOPS,
+    HORSE_USE_MIN_HOP_COST, HORSE_USE_MIN_HOP_COST_EARLY,
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
     RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY, MAX_ROUND,
     SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
@@ -377,6 +381,8 @@ def _decide_action_impl(
                     weather, route_blocked, obstacle_nodes=obstacle_nodes,
                     process_nodes=process_nodes,
                     processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+                    tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
+                    enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
                 )
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -498,6 +504,8 @@ def _decide_action_impl(
                 graph, current_node_id, player, gate_node_id, terminal_node_ids,
                 weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
                 processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+                tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
+                enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
             )
             if move_target:
                 return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -562,6 +570,7 @@ def _decide_action_impl(
         resource_action = _handle_resources(
             match_id, round_num, player_id, player, graph,
             current_node_id, current_node, phase, weather,
+            gate_node_id=gate_node_id,
         )
         if resource_action is not None:
             return resource_action
@@ -631,6 +640,9 @@ def _decide_action_impl(
         weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
         visited_node_ids=set() if force_delivery else visited_node_ids,
+        tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
+        enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
+        force_delivery=force_delivery,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -1177,6 +1189,7 @@ def _plan_force_delivery_move(
     horse_action = _use_horse_before_expensive_hop(
         match_id, round_num, player_id, player, graph,
         current_node_id, target, weather, process_nodes,
+        force_delivery=True,
     )
     if horse_action is not None:
         return horse_action
@@ -1309,6 +1322,14 @@ def _resolve_guarded_delivery_hop(
     ])
 
 
+def _horse_use_min_hop_cost(player: dict, force_delivery: bool = False) -> float:
+    if force_delivery:
+        return HORSE_USE_MIN_HOP_COST
+    if get_task_score(player) < TASK_SCORE_TARGET:
+        return HORSE_USE_MIN_HOP_COST_EARLY
+    return HORSE_USE_MIN_HOP_COST
+
+
 def _use_horse_before_expensive_hop(
     match_id: str,
     round_num: int,
@@ -1319,14 +1340,15 @@ def _use_horse_before_expensive_hop(
     target_node_id: str,
     weather: dict | None,
     process_nodes: dict[str, dict] | None,
+    force_delivery: bool = False,
 ) -> dict | None:
-    """Use horse buff before a high-cost edge during forced delivery."""
+    """Use horse buff before a high-cost edge."""
     if not target_node_id or current_node_id == target_node_id:
         return None
     hop_cost = graph.edge_cost(
         current_node_id, target_node_id, weather, None, process_nodes,
     )
-    if hop_cost < 30:
+    if hop_cost < _horse_use_min_hop_cost(player, force_delivery):
         return None
     if has_resource(player, "FAST_HORSE"):
         logger.info(
@@ -1347,6 +1369,193 @@ def _use_horse_before_expensive_hop(
     return None
 
 
+def _should_use_task_aware_routing(player: dict, phase: str, force_delivery: bool) -> bool:
+    if force_delivery:
+        return False
+    my_task_score = get_task_score(player)
+    if my_task_score >= TASK_SCORE_TARGET:
+        return False
+    if phase == "RUSH" and my_task_score >= 60:
+        return False
+    return True
+
+
+def _task_routable(
+    task: dict,
+    player: dict,
+    obstacle_nodes: set[str] | None,
+) -> bool:
+    template_id = get_task_template_id(task)
+    if template_id.startswith("T06"):
+        if not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
+            return False
+    if template_id.startswith("T04"):
+        task_node = task.get("nodeId", "")
+        if obstacle_nodes and task_node and task_node not in obstacle_nodes:
+            return False
+    return True
+
+
+def _route_bucket_task_scores(
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+) -> dict[str, int]:
+    scores: dict[str, int] = {}
+    for task in tasks:
+        if not is_task_available(task, player_id, failed_task_ids, enemy_busy_task_ids):
+            continue
+        if not _task_routable(task, player, obstacle_nodes):
+            continue
+        bucket = task.get("routeBucket") or "ROAD"
+        scores[bucket] = scores.get(bucket, 0) + get_task_point_value(task)
+    return scores
+
+
+def _weighted_path_cost(
+    graph: MapGraph,
+    start: str,
+    end: str,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> float:
+    path = graph.weighted_shortest_path(start, end, weather, blocked, process_nodes)
+    if not path:
+        return float("inf")
+    return sum(
+        graph.edge_cost(path[i], path[i + 1], weather, blocked, process_nodes)
+        for i in range(len(path) - 1)
+    )
+
+
+def _neighbor_task_yield(
+    graph: MapGraph,
+    current_node_id: str,
+    neighbor: str,
+    goal_node: str,
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+) -> int:
+    """Sum claimable task points on the path via neighbor or within detour budget."""
+    path = graph.weighted_shortest_path(neighbor, goal_node, weather, blocked, process_nodes)
+    on_path = set(path) if path else set()
+    total = 0
+
+    for task in tasks:
+        if not is_task_available(task, player_id, failed_task_ids, enemy_busy_task_ids):
+            continue
+        if not _task_routable(task, player, obstacle_nodes):
+            continue
+        task_node = task.get("nodeId", "")
+        if not task_node:
+            continue
+
+        if task_node in on_path or task_node == neighbor:
+            total += get_task_point_value(task)
+            continue
+
+        detour = _calc_detour_cost(
+            graph, current_node_id, task_node, gate_node_id, terminal_node_ids,
+            weather, blocked, player, process_nodes,
+        )
+        if detour <= MAX_TASK_DETOUR_COST:
+            total += get_task_point_value(task)
+
+    return total
+
+
+def _score_navigation_neighbor(
+    graph: MapGraph,
+    current_node_id: str,
+    neighbor: str,
+    goal_node: str,
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+    visited_node_ids: set[str],
+    bucket_scores: dict[str, int],
+) -> float:
+    hop_cost = graph.edge_cost(current_node_id, neighbor, weather, blocked, process_nodes)
+    tail_cost = _weighted_path_cost(graph, neighbor, goal_node, weather, blocked, process_nodes)
+    if tail_cost == float("inf"):
+        return float("inf")
+
+    score = hop_cost + tail_cost
+    if neighbor in visited_node_ids:
+        score += ROUTE_VISITED_BACKTRACK_PENALTY
+
+    task_yield = _neighbor_task_yield(
+        graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
+        gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
+        failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+    )
+    score -= task_yield * ROUTE_TASK_BONUS_PER_SCORE
+
+    edge_type = graph.get_edge_route_type(current_node_id, neighbor)
+    score -= bucket_scores.get(edge_type, 0) * ROUTE_BUCKET_BONUS_PER_SCORE
+    return score
+
+
+def _pick_task_aware_neighbor(
+    graph: MapGraph,
+    current_node_id: str,
+    available: list[str],
+    goal_node: str,
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+    visited_node_ids: set[str],
+) -> str | None:
+    if not available or not goal_node:
+        return None
+
+    bucket_scores = _route_bucket_task_scores(
+        tasks, player_id, player, failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+    )
+    best_neighbor = None
+    best_score = float("inf")
+    for neighbor in available:
+        nav_score = _score_navigation_neighbor(
+            graph, current_node_id, neighbor, goal_node, tasks, player_id, player,
+            gate_node_id, terminal_node_ids, weather, blocked, process_nodes,
+            failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+            visited_node_ids, bucket_scores,
+        )
+        if nav_score < best_score:
+            best_score = nav_score
+            best_neighbor = neighbor
+    return best_neighbor
+
+
 def _find_move_target(
     graph: MapGraph,
     current_node_id: str,
@@ -1360,6 +1569,12 @@ def _find_move_target(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
+    tasks: list[dict] | None = None,
+    player_id: int = 0,
+    failed_task_ids: set[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
+    phase: str = "",
+    force_delivery: bool = False,
 ) -> str | None:
     """Find the best move target using weighted shortest path toward the current goal.
 
@@ -1379,25 +1594,25 @@ def _find_move_target(
 
     # Filter out failed target, obstacle nodes, and enemy-guarded nodes when alternatives exist
     guard_blocked = blocked or set()
-    available = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
+    all_safe = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
     if guard_blocked:
-        safe = [n for n in available if n not in guard_blocked]
+        safe = [n for n in all_safe if n not in guard_blocked]
         if safe:
-            available = safe
-    forward_available = [n for n in available if n not in visited_node_ids]
+            all_safe = safe
+    forward_available = [n for n in all_safe if n not in visited_node_ids]
     if forward_available:
         available = forward_available
+    else:
+        available = all_safe or neighbors
     logger.info("_find_move_target: current=%s neighbors=%s available=%s visited=%s failed_target=%s",
                 current_node_id, neighbors, available, visited_node_ids, failed_target)
-    if not available:
-        # Fall back: allow backtrack but still avoid guarded nodes if possible
-        available = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
-        if guard_blocked:
-            safe = [n for n in available if n not in guard_blocked]
-            if safe:
-                available = safe
-        if not available:
-            available = neighbors
+
+    if tasks is None:
+        tasks = []
+    if failed_task_ids is None:
+        failed_task_ids = set()
+    if enemy_busy_task_ids is None:
+        enemy_busy_task_ids = set()
 
     goal_node = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None, process_nodes)
 
@@ -1408,6 +1623,27 @@ def _find_move_target(
             nid: info for nid, info in process_nodes.items()
             if nid not in processed_node_ids
         }
+
+    if goal_node and _should_use_task_aware_routing(player, phase, force_delivery):
+        task_candidates = all_safe or available
+        task_step = _pick_task_aware_neighbor(
+            graph, current_node_id, task_candidates, goal_node, tasks, player_id, player,
+            gate_node_id, terminal_node_ids, weather, guard_blocked,
+            remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
+            obstacle_nodes, visited_node_ids,
+        )
+        if task_step and task_step in available:
+            task_yield = _neighbor_task_yield(
+                graph, current_node_id, task_step, goal_node, tasks, player_id, player,
+                gate_node_id, terminal_node_ids, weather, guard_blocked,
+                remaining_process_nodes, failed_task_ids, enemy_busy_task_ids,
+                obstacle_nodes,
+            )
+            logger.info(
+                "task-aware move %s->%s (yield=%d, taskScore=%d)",
+                current_node_id, task_step, task_yield, get_task_score(player),
+            )
+            return task_step
 
     if goal_node:
         # Build soft-blocked set: obstacles + visited + enemy guards
@@ -2149,14 +2385,20 @@ def _handle_tasks(
             candidates.sort(key=lambda x: (-x[2], x[1]))
             best_task = candidates[0][0]
             task_node = best_task.get("nodeId", "")
-            # Move toward the task node using weighted routing, avoid backtracking
+            # Move toward task: avoid obstacles/guards, but do not block visited nodes
             soft_blocked = set(obstacle_nodes)
-            soft_blocked.update(visited_node_ids)
-            soft_blocked.discard(task_node)  # Don't block the target
-            step = graph.next_step_toward(current_node_id, task_node, weather, soft_blocked, use_weighted=True, process_nodes=process_nodes)
+            if blocked:
+                soft_blocked.update(blocked)
+            soft_blocked.discard(task_node)
+            step = graph.next_step_toward(
+                current_node_id, task_node, weather, soft_blocked,
+                use_weighted=True, process_nodes=process_nodes,
+            )
             if not step:
-                # Fallback without soft-blocked
-                step = graph.next_step_toward(current_node_id, task_node, weather, obstacle_nodes, use_weighted=True, process_nodes=process_nodes)
+                step = graph.next_step_toward(
+                    current_node_id, task_node, weather, obstacle_nodes,
+                    use_weighted=True, process_nodes=process_nodes,
+                )
             if step:
                 logger.info("Round %d: Moving toward task at %s (template=%s), step=%s", round_num, task_node, get_task_template_id(best_task), step)
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
@@ -2197,6 +2439,7 @@ def _handle_resources(
     match_id: str, round_num: int, player_id: int,
     player: dict, graph: MapGraph, current_node_id: str,
     current_node: dict | None, phase: str, weather: dict | None,
+    gate_node_id: str = "",
 ) -> dict | None:
     """Handle resource claiming strategy (策略文档 §6).
 
@@ -2206,6 +2449,10 @@ def _handle_resources(
         return None
     if phase == "RUSH" or round_num >= 360:
         return None
+
+    near_gate = False
+    if gate_node_id and current_node_id:
+        near_gate = graph.path_length(current_node_id, gate_node_id, weather, None) <= NEAR_GATE_RESOURCE_HOPS
 
     resources = find_available_resources(current_node)
     if not resources:
@@ -2232,6 +2479,8 @@ def _handle_resources(
         # Claim OFFICIAL_PERMIT/PASS_TOKEN for window contests
         # Keep at least PERMIT_RESERVE+1 (1 for current use + reserve for GATE)
         if rtype in WINDOW_RESOURCES:
+            if near_gate:
+                continue
             total_permits = my_resources.get("OFFICIAL_PERMIT", 0) + my_resources.get("PASS_TOKEN", 0)
             if total_permits < PERMIT_RESERVE + 1:
                 logger.info("Round %d: Claiming resource %s at %s (for window contests)", round_num, rtype, current_node_id)
@@ -2326,6 +2575,7 @@ def _handle_use_resources(
             horse_action = _use_horse_before_expensive_hop(
                 match_id, round_num, player_id, player, graph,
                 current_node_id, direct_target, weather, process_nodes,
+                force_delivery=True,
             )
             if horse_action is not None:
                 return horse_action
@@ -2338,6 +2588,7 @@ def _handle_use_resources(
             horse_action = _use_horse_before_expensive_hop(
                 match_id, round_num, player_id, player, graph,
                 current_node_id, next_step, weather, process_nodes,
+                force_delivery=False,
             )
             if horse_action is not None:
                 return horse_action

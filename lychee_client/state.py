@@ -39,6 +39,12 @@ TASK_PRIORITY = {
 TASK_SCORE_TARGET = 90
 TASK_SCORE_STRETCH = 110
 MAX_TASK_DETOUR_COST = 15
+ROUTE_TASK_BONUS_PER_SCORE = 10
+ROUTE_VISITED_BACKTRACK_PENALTY = 25
+ROUTE_BUCKET_BONUS_PER_SCORE = 4
+NEAR_GATE_RESOURCE_HOPS = 8
+HORSE_USE_MIN_HOP_COST = 30
+HORSE_USE_MIN_HOP_COST_EARLY = 18
 ICE_BOX_FRESHNESS_THRESHOLD = 82
 MAX_ROUND = 600
 SQUAD_CLEAR_COST = 2
@@ -62,6 +68,37 @@ def get_team_id(player: dict) -> str:
 
 def get_task_template_id(task: dict) -> str:
     return task.get("taskTemplateId") or task.get("templateId", "")
+
+
+def get_task_point_value(task: dict) -> int:
+    template_id = get_task_template_id(task)
+    if template_id in TASK_PRIORITY:
+        return TASK_PRIORITY[template_id][0]
+    for prefix, (score, _, _) in TASK_PRIORITY.items():
+        if template_id.startswith(prefix):
+            return score
+    return int(task.get("score", 0) or 0)
+
+
+def is_task_available(
+    task: dict,
+    player_id: int,
+    failed_task_ids: set[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
+) -> bool:
+    """Whether a task instance is still worth routing toward."""
+    if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
+        return False
+    task_id = task.get("taskId", "")
+    if failed_task_ids and task_id in failed_task_ids:
+        return False
+    if enemy_busy_task_ids and task_id in enemy_busy_task_ids:
+        return False
+    protection = task.get("protectionPlayerId", 0)
+    if protection not in (0, player_id):
+        return False
+    owner = task.get("ownerPlayerId", 0)
+    return owner in (0, player_id)
 
 
 def node_has_obstacle(node: dict) -> bool:
