@@ -42,6 +42,7 @@ from lychee_client.state import (
     GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
     GUARD_RESERVE_FOR_GATE, FINAL_CORRIDOR_GATE_HOPS,
     FINAL_CORRIDOR_GUARD_MIN_LEAD, FINAL_CORRIDOR_GUARD_TASK_MIN,
+    GATE_DELAY_GUARD_MIN_OPP_HOPS, GATE_DELAY_GUARD_EXTRA_FRUIT,
     ICE_BOX_NEAR_GATE_HOPS, GATE_ENTRY_DEADLINE_ROUND, GATE_ARRIVAL_TARGET_ROUND,
     EARLY_GAME_MAX_ROUND,
     SQUAD_CLEAR_MIN_ROUND, SQUAD_CLEAR_MIDMAP_MIN_ROUND, LATE_GAME_NO_MID_TASK_ROUND,
@@ -893,6 +894,23 @@ def _decide_action_impl(
     process_type = None if already_processed_here else _get_process_type(current_node, process_nodes, current_node_id)
     if process_type and is_verify_process(process_type) and is_verified(player):
         process_type = None
+
+    # 已验核且在宫门：稳妥做法——对手未到时先补拖延卡，否则直接前往终点
+    if (
+        gate_node_id
+        and is_at_node(player, gate_node_id)
+        and is_verified(player)
+        and phase == "RUSH"
+        and can_act(player)
+    ):
+        delay_guard = _try_gate_delay_guard_after_verify(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
+            weather, obstacle_nodes, inquire_nodes, my_team_id,
+            opp_player, phase, force_delivery=force_delivery,
+        )
+        if delay_guard is not None:
+            return delay_guard
 
     # 已验核且在宫门：优先前往终点交付
     if (
@@ -4927,6 +4945,8 @@ def _is_final_corridor_guard_site(
         return True
     if _is_pass_transfer_node(process_nodes, node_id):
         return True
+    if gate_node_id and node_id == gate_node_id:
+        return True
     node_type = _get_inquire_node_type(_get_inquire_node(inquire_nodes, node_id))
     return node_type in ("PASS", "KEY_PASS")
 
@@ -4961,9 +4981,15 @@ def _guard_extra_good_fruit(
     inquire_nodes: list[dict] | None = None,
     current_node_id: str = "",
     task_score: int = 0,
+    gate_node_id: str = "",
 ) -> int:
     good = get_good_fruit(player)
     reserve = 1 + GUARD_GOOD_FRUIT_RESERVE
+    if gate_node_id and current_node_id == gate_node_id:
+        extra = GATE_DELAY_GUARD_EXTRA_FRUIT
+        if good >= 1 + extra + reserve:
+            return extra
+        return 0
     if (
         inquire_nodes
         and current_node_id
@@ -4982,8 +5008,11 @@ def _guard_good_fruit_sufficient(
     inquire_nodes: list[dict] | None = None,
     current_node_id: str = "",
     task_score: int = 0,
+    gate_node_id: str = "",
 ) -> bool:
-    extra = _guard_extra_good_fruit(player, inquire_nodes, current_node_id, task_score)
+    extra = _guard_extra_good_fruit(
+        player, inquire_nodes, current_node_id, task_score, gate_node_id,
+    )
     return get_good_fruit(player) >= 1 + extra + GUARD_GOOD_FRUIT_RESERVE
 
 
@@ -5008,7 +5037,7 @@ def _evaluate_dual_guard_slot(
         return False, "already-guarded"
     task_score = get_task_score(player)
     if not _guard_good_fruit_sufficient(
-        player, inquire_nodes, current_node_id, task_score,
+        player, inquire_nodes, current_node_id, task_score, gate_node_id,
     ):
         return False, "low-fruit"
     if not _is_key_choke_node(graph, current_node_id):
@@ -5068,6 +5097,93 @@ def _evaluate_dual_guard_slot(
     return True, f"guard2,after-{first_node},opp-path,choke"
 
 
+def _should_set_gate_delay_guard(
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    obstacle_nodes: set[str],
+    player: dict,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    player_id: int,
+    opp_player: dict | None,
+    phase: str,
+    force_delivery: bool = False,
+) -> tuple[bool, str]:
+    """稳妥做法：验核完成后、对手未到宫门时，补一张拖延卡再前往终点。"""
+    if force_delivery or phase != "RUSH":
+        return False, "not-rush"
+    if not gate_node_id or current_node_id != gate_node_id:
+        return False, "not-at-gate"
+    if not is_verified(player) or not can_act(player):
+        return False, "not-verified-idle"
+    if not opp_player:
+        return False, "no-opp"
+    if get_task_score(player) < FINAL_CORRIDOR_GUARD_TASK_MIN:
+        return False, "task-too-low"
+    if _count_own_active_guards(inquire_nodes, my_team_id, player_id) >= MAX_ACTIVE_GUARDS:
+        return False, "max-guards"
+    if _own_guard_active_at(inquire_nodes, gate_node_id, my_team_id, player_id):
+        return False, "gate-already-guarded"
+
+    opp_node = opp_player.get("currentNodeId", "")
+    if opp_node == gate_node_id:
+        return False, "opp-at-gate"
+    if opp_node:
+        opp_hops = graph.path_length(opp_node, gate_node_id, weather, obstacle_nodes)
+        if opp_hops != float("inf") and opp_hops < GATE_DELAY_GUARD_MIN_OPP_HOPS:
+            return False, f"opp-too-close({int(opp_hops)})"
+
+    if not _guard_good_fruit_sufficient(
+        player, inquire_nodes, current_node_id, get_task_score(player), gate_node_id,
+    ):
+        return False, "low-fruit"
+    if get_good_fruit(player) <= 1:
+        return False, "need-delivery-fruit"
+
+    return True, "gate-delay-after-verify"
+
+
+def _try_gate_delay_guard_after_verify(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    obstacle_nodes: set[str],
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    opp_player: dict | None,
+    phase: str,
+    force_delivery: bool = False,
+) -> dict | None:
+    should, reason = _should_set_gate_delay_guard(
+        graph, current_node_id, gate_node_id, terminal_node_ids,
+        weather, obstacle_nodes, player, inquire_nodes,
+        my_team_id, player_id, opp_player, phase,
+        force_delivery=force_delivery,
+    )
+    if not should:
+        return None
+    task_score = get_task_score(player)
+    extra = _guard_extra_good_fruit(
+        player, inquire_nodes, current_node_id, task_score, gate_node_id,
+    )
+    logger.info(
+        "Round %d: Gate delay guard at %s (%s, extra=%d)",
+        round_num, current_node_id, reason, extra,
+    )
+    return make_action(match_id, round_num, player_id, [
+        make_set_guard_action(current_node_id, extra_good_fruit=extra),
+    ])
+
+
 def _should_set_guard_dynamic(
     graph: MapGraph,
     current_node_id: str,
@@ -5111,10 +5227,10 @@ def _should_set_guard_dynamic(
         hops_to_gate = graph.path_length(current_node_id, gate_node_id, weather, obstacle_nodes)
 
     if phase == "RUSH":
-        if is_verified(player):
-            return False, "rush-verified"
-        if gate_node_id and current_node_id == gate_node_id:
-            return False, "rush-priority-verify-deliver"
+        if gate_node_id and current_node_id == gate_node_id and not is_verified(player):
+            return False, "rush-priority-verify"
+        if is_verified(player) and gate_node_id and current_node_id == gate_node_id:
+            return False, "rush-gate-delay-handled"
 
     if mode == "GATE_FIGHT":
         if task_score >= 60 and hops_to_gate <= 4:
@@ -5124,15 +5240,15 @@ def _should_set_guard_dynamic(
         if _own_guard_active_at(inquire_nodes, current_node_id, my_team_id, player_id):
             return False, "already-guarded"
         if not _guard_good_fruit_sufficient(
-            player, inquire_nodes, current_node_id, task_score,
+            player, inquire_nodes, current_node_id, task_score, gate_node_id,
         ):
             return False, "low-fruit"
+        if gate_node_id and current_node_id == gate_node_id:
+            return False, "gate-fight-deliver-first"
         if final_guard_site:
             return True, "gate-fight-final-choke"
         if _is_key_choke_node(graph, current_node_id):
             return True, "gate-fight-choke"
-        if gate_node_id and current_node_id == gate_node_id:
-            return True, "gate-fight-gate"
         return False, "gate-fight-skip"
 
     if not opp_player:
@@ -5164,6 +5280,25 @@ def _try_leave_own_guard_node(
     """After SET_GUARD, leave the node via detour so we do not block ourselves."""
     if not current_node_id or current_node_id not in own_guard_sites:
         return None
+
+    if (
+        gate_node_id
+        and current_node_id == gate_node_id
+        and is_verified(player)
+        and terminal_node_ids
+    ):
+        for tid in terminal_node_ids:
+            if tid == current_node_id:
+                continue
+            step = graph.next_step_toward(
+                current_node_id, tid, weather, None, use_weighted=True,
+            )
+            if step:
+                logger.info(
+                    "Round %d: leaving gate guard at %s, advance to %s for delivery",
+                    round_num, current_node_id, step,
+                )
+                return make_action(match_id, round_num, player_id, [make_move_action(step)])
 
     detour = _find_delivery_detour_step(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
@@ -5211,7 +5346,7 @@ def _try_set_guard_action(
         return None
     task_score = get_task_score(player)
     extra = _guard_extra_good_fruit(
-        player, inquire_nodes, current_node_id, task_score,
+        player, inquire_nodes, current_node_id, task_score, gate_node_id,
     )
     logger.info("Round %d: Setting guard at %s (%s, extra=%d)", round_num, current_node_id, reason, extra)
     return make_action(match_id, round_num, player_id, [
