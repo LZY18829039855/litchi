@@ -57,6 +57,7 @@ class GameClient:
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
         self.last_node_id: str = ""
+        self.task_claimed_this_stop: bool = False
         self.start_round: int = 1
         self.running = False
 
@@ -234,6 +235,7 @@ class GameClient:
             self.last_forced_pass_target = ""
             self.guard_blocked_targets.discard(current_node_id)
             self.avoid_route_nodes.discard(current_node_id)
+            self.task_claimed_this_stop = False
             self.last_node_id = current_node_id
             self.visited_node_ids.add(current_node_id)
 
@@ -569,6 +571,7 @@ class GameClient:
             guard_stuck_target=self.guard_stuck_target,
             own_guard_sites=self.own_guard_sites,
             map_gameplay=self.map_gameplay,
+            task_claimed_this_stop=self.task_claimed_this_stop,
         )
 
         self.send_message(action_msg)
@@ -587,6 +590,7 @@ class GameClient:
             action_detail = f"({actions[0].get('taskId', '?')})"
             self.last_claimed_task_id = actions[0].get("taskId", "")
             self.last_claimed_task_node_id = current_node_id or ""
+            self.task_claimed_this_stop = True
         self.last_forced_pass_target = actions[0].get("targetNodeId", "") if action_type == "FORCED_PASS" else ""
         for action_item in actions:
             if action_item.get("action") == "SQUAD_CLEAR":

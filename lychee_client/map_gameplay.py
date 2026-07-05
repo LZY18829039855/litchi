@@ -75,6 +75,7 @@ class MapGameplayContext:
     pass_token_nodes: frozenset[str] = frozenset()
     official_permit_nodes: frozenset[str] = frozenset()
     intel_nodes: frozenset[str] = frozenset()
+    start_node_id: str = ""
 
 
 def default_map_gameplay() -> MapGameplayContext:
@@ -253,4 +254,5 @@ def build_map_gameplay(start_raw: dict[str, Any], graph: MapGraph | None) -> Map
         pass_token_nodes=pass_nodes,
         official_permit_nodes=permit_nodes,
         intel_nodes=intel_nodes,
+        start_node_id=start_node_id,
     )
