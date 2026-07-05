@@ -974,8 +974,8 @@ def _decide_action_impl(
         if gate_action is not None:
             return gate_action
 
-    # --- P2/P3: Task strategy — 交付余量内尽可能多做顺路/小绕路任务 ---
-    if not force_delivery and not delivery_critical:
+    # --- P2/P3: Task strategy — 每帧读取 inquire.tasks 动态规划；冲刺时也领当前站顺路任务 ---
+    if not delivery_critical:
         task_action = _handle_tasks(
             match_id, round_num, player_id, player, graph,
             current_node_id, tasks, player_id, phase, weather, blocked,
@@ -985,7 +985,7 @@ def _decide_action_impl(
             failed_task_ids=failed_task_ids,
             enemy_busy_task_ids=enemy_busy_task_ids,
             max_task_detour=max_task_detour,
-            allow_detour=delivery_slack > 0,
+            allow_detour=not force_delivery and delivery_slack > 0,
             delivery_slack=delivery_slack,
             map_gameplay=map_gameplay,
             task_claimed_this_stop=task_claimed_this_stop,
@@ -1039,6 +1039,10 @@ def _decide_action_impl(
         map_gameplay=map_gameplay,
         inquire_nodes=inquire_nodes,
         visited_node_ids=visited_node_ids,
+        tasks=tasks,
+        failed_task_ids=failed_task_ids,
+        enemy_busy_task_ids=enemy_busy_task_ids,
+        obstacle_nodes=obstacle_nodes,
     )
     if use_res_action is not None:
         return use_res_action
@@ -1714,6 +1718,72 @@ def _find_direct_delivery_step(
     return graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
 
 
+def _goal_path_cost(
+    graph: MapGraph,
+    node_id: str,
+    goal_node_id: str,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> float:
+    """Weighted cost from node to goal; used for monotonic route planning."""
+    if not node_id or not goal_node_id:
+        return float("inf")
+    path = graph.weighted_shortest_path(node_id, goal_node_id, weather, blocked, process_nodes)
+    if not path:
+        return float("inf")
+    return sum(
+        graph.edge_cost(path[i], path[i + 1], weather, blocked, process_nodes)
+        for i in range(len(path) - 1)
+    )
+
+
+def _neighbor_advances_toward_goal(
+    graph: MapGraph,
+    current_node_id: str,
+    neighbor: str,
+    goal_node_id: str,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> bool:
+    """下一跳不远离终点（允许等距分叉，禁止折返）。"""
+    if not goal_node_id or neighbor == goal_node_id:
+        return True
+    cur_cost = _goal_path_cost(
+        graph, current_node_id, goal_node_id, weather, blocked, process_nodes,
+    )
+    nxt_cost = _goal_path_cost(
+        graph, neighbor, goal_node_id, weather, blocked, process_nodes,
+    )
+    if nxt_cost == float("inf"):
+        return False
+    if cur_cost == float("inf"):
+        return True
+    return nxt_cost <= cur_cost + 1e-6
+
+
+def _filter_toward_goal_neighbors(
+    graph: MapGraph,
+    current_node_id: str,
+    neighbors: list[str],
+    goal_node_id: str,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+) -> list[str]:
+    """只保留朝终点前进的邻居；全部被挡时才回退到原列表。"""
+    if not goal_node_id or not neighbors:
+        return neighbors
+    toward = [
+        n for n in neighbors
+        if _neighbor_advances_toward_goal(
+            graph, current_node_id, n, goal_node_id, weather, blocked, process_nodes,
+        )
+    ]
+    return toward if toward else neighbors
+
+
 def _find_delivery_detour_step(
     graph: MapGraph,
     current_node_id: str,
@@ -1725,6 +1795,7 @@ def _find_delivery_detour_step(
     processed_node_ids: set[str],
     route_blocked: set[str],
     avoid_nodes: set[str] | None = None,
+    require_toward_goal: bool = True,
 ) -> str | None:
     """Pick an unblocked neighbor that still reaches the delivery goal."""
     if avoid_nodes is None:
@@ -1744,11 +1815,20 @@ def _find_delivery_detour_step(
         }
 
     routing_blocked = set(route_blocked) | set(avoid_nodes)
+    candidates = [
+        n for n in graph.get_neighbors(current_node_id)
+        if n not in avoid_nodes
+    ]
+    if require_toward_goal:
+        toward = _filter_toward_goal_neighbors(
+            graph, current_node_id, candidates, goal_node, weather,
+            routing_blocked, remaining_process_nodes,
+        )
+        if toward:
+            candidates = toward
     best_step = None
     best_cost = float("inf")
-    for neighbor in graph.get_neighbors(current_node_id):
-        if neighbor in avoid_nodes:
-            continue
+    for neighbor in candidates:
         path = graph.weighted_shortest_path(
             neighbor, goal_node, weather, routing_blocked, remaining_process_nodes,
         )
@@ -1883,7 +1963,8 @@ def _plan_force_delivery_move(
     """Resolve the next force-delivery hop, including detour and guard handling."""
     path_avoid = set(avoid_route_nodes)
     if current_node_id not in GATE_CORRIDOR_NODES:
-        path_avoid |= obstacle_nodes
+        # 入关走廊障碍应 FORCED_PASS/CLEAR，不应绕到 S08 等折返山路
+        path_avoid |= {n for n in obstacle_nodes if n not in GATE_CORRIDOR_NODES}
     direct_target = _find_direct_delivery_step(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
@@ -1922,6 +2003,25 @@ def _plan_force_delivery_move(
 
     if not target:
         return None
+
+    if detour and gate_node_id and not _neighbor_advances_toward_goal(
+        graph, current_node_id, target, gate_node_id, weather, route_blocked, process_nodes,
+    ):
+        logger.info(
+            "Round %d: %s reject backtrack detour %s, try blocker on %s",
+            round_num, log_prefix, target, direct_target or target,
+        )
+        if direct_target and (
+            direct_target in route_blocked or direct_target in obstacle_nodes
+        ):
+            target = direct_target
+            detour = False
+        elif direct_target and _neighbor_advances_toward_goal(
+            graph, current_node_id, direct_target, gate_node_id, weather,
+            route_blocked, process_nodes,
+        ):
+            target = direct_target
+            detour = False
 
     if not detour:
         if target in route_blocked or target in obstacle_nodes:
@@ -2175,6 +2275,41 @@ def _should_use_task_aware_routing(
     if delivery_slack <= TASK_DETOUR_SLACK_RESERVE:
         return False
     return True
+
+
+def _tasks_on_planned_route(
+    graph: MapGraph,
+    current_node_id: str,
+    goal_node_id: str,
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    weather: dict | None,
+    blocked: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+) -> list[dict]:
+    """计划路径上尚未完成、可领取的任务（每帧随 inquire.tasks 更新）。"""
+    if not goal_node_id or not current_node_id:
+        return []
+    path = graph.weighted_shortest_path(
+        current_node_id, goal_node_id, weather, blocked, process_nodes,
+    )
+    if not path:
+        path = graph.shortest_path(current_node_id, goal_node_id, weather, blocked) or []
+    on_path = set(path)
+    result: list[dict] = []
+    for task in tasks:
+        if not is_task_available(task, player_id, failed_task_ids, enemy_busy_task_ids):
+            continue
+        if not _task_routable(task, player, obstacle_nodes):
+            continue
+        task_node = task.get("nodeId", "")
+        if task_node in on_path:
+            result.append(task)
+    return result
 
 
 def _task_routable(
@@ -2587,6 +2722,11 @@ def _score_navigation_neighbor(
         return float("inf")
 
     score = hop_cost + tail_cost
+    cur_to_goal = _goal_path_cost(
+        graph, current_node_id, goal_node, weather, blocked, process_nodes,
+    )
+    if cur_to_goal != float("inf") and tail_cost > cur_to_goal + 1e-6:
+        score += WATER_ROUTE_NAV_PENALTY
     if neighbor in visited_node_ids:
         score += ROUTE_VISITED_BACKTRACK_PENALTY
 
@@ -2634,6 +2774,11 @@ def _pick_task_aware_neighbor(
 ) -> str | None:
     if not available or not goal_node:
         return None
+
+    available = _filter_toward_goal_neighbors(
+        graph, current_node_id, available, goal_node, weather,
+        blocked, process_nodes,
+    )
 
     bucket_scores = _route_bucket_task_scores(
         tasks, player_id, player, failed_task_ids, enemy_busy_task_ids,
@@ -2767,6 +2912,34 @@ def _find_move_target(
             nid: info for nid, info in process_nodes.items()
             if nid not in processed_node_ids
         }
+
+    if goal_node:
+        available = _filter_toward_goal_neighbors(
+            graph, current_node_id, available, goal_node, weather,
+            guard_blocked, remaining_process_nodes,
+        )
+        all_safe = _filter_toward_goal_neighbors(
+            graph, current_node_id, all_safe, goal_node, weather,
+            guard_blocked, remaining_process_nodes,
+        )
+        logger.info(
+            "_find_move_target: toward-goal filtered available=%s (goal=%s)",
+            available, goal_node,
+        )
+
+    route_tasks = _tasks_on_planned_route(
+        graph, current_node_id, goal_node or gate_node_id, tasks, player_id, player,
+        weather, guard_blocked, remaining_process_nodes,
+        failed_task_ids, enemy_busy_task_ids, obstacle_nodes,
+    )
+    if route_tasks:
+        logger.debug(
+            "Round %d: planned-route tasks=%d score=%d at %s",
+            round_num,
+            len(route_tasks),
+            sum(get_task_point_value(t) for t in route_tasks),
+            current_node_id,
+        )
 
     if force_delivery and goal_node:
         step = _find_direct_delivery_step(
@@ -3263,11 +3436,15 @@ def _handle_blocked_by_guard(
     neighbors = graph.get_neighbors(current_node_id)
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
 
-    # Detour via unblocked neighbor (e.g. S09→S05 when S10 guarded)
+    # Detour via unblocked neighbor that still advances toward goal
     best_detour = None
     best_cost = float("inf")
     for n in neighbors:
         if n in blocked:
+            continue
+        if goal and not _neighbor_advances_toward_goal(
+            graph, current_node_id, n, goal, weather, blocked, process_nodes,
+        ):
             continue
         if not goal:
             return make_action(match_id, round_num, player_id, [make_move_action(n)])
@@ -3562,8 +3739,16 @@ def _handle_tasks(
                 make_claim_task_action(task_id)
             ])
 
-    # Look for nearby tasks within detour budget (交付余量内尽量多拿)
+    # Look for nearby tasks within detour budget (交付余量内尽量多拿顺路任务)
     if allow_detour and max_task_detour > 0:
+        planned_route_ids = {
+            t.get("taskId", "")
+            for t in _tasks_on_planned_route(
+                graph, current_node_id, goal_node_id, tasks, my_player_id, player,
+                weather, blocked, process_nodes, failed_task_ids,
+                enemy_busy_task_ids, obstacle_nodes,
+            )
+        }
         candidates = []
         for task in tasks:
             if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
@@ -3656,12 +3841,13 @@ def _handle_tasks(
                 if tid.startswith(prefix):
                     spr = score_per_round
                     break
-            candidates.append((task, detour, spr))
+            on_planned_route = task.get("taskId", "") in planned_route_ids
+            candidates.append((task, detour, spr, on_planned_route))
 
         if candidates:
-            # Sort by: score-per-round descending, then detour ascending
-            candidates.sort(key=lambda x: (-x[2], x[1]))
-            for best_task, _detour, _spr in candidates:
+            # 计划路径上的任务优先，其次 score/round，再按绕路成本
+            candidates.sort(key=lambda x: (not x[3], -x[2], x[1]))
+            for best_task, _detour, _spr, on_route in candidates:
                 task_node = best_task.get("nodeId", "")
                 template_id = get_task_template_id(best_task)
                 soft_blocked = set(obstacle_nodes)
@@ -3682,11 +3868,16 @@ def _handle_tasks(
                     )
                 if not step or step in visited_node_ids:
                     continue
+                if goal_node_id and not _neighbor_advances_toward_goal(
+                    graph, current_node_id, step, goal_node_id, weather,
+                    soft_blocked, process_nodes,
+                ):
+                    continue
                 if step in soft_blocked or step in guard_blocked_targets:
                     continue
                 logger.info(
-                    "Round %d: Moving toward task at %s (template=%s), step=%s",
-                    round_num, task_node, get_task_template_id(best_task), step,
+                    "Round %d: Moving toward task at %s (template=%s, onRoute=%s), step=%s",
+                    round_num, task_node, get_task_template_id(best_task), on_route, step,
                 )
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
 
@@ -3960,6 +4151,44 @@ def _pick_scout_target(
     return best
 
 
+def _pick_intel_task_target(
+    graph: MapGraph,
+    current_node_id: str,
+    goal_node_id: str,
+    tasks: list[dict],
+    player_id: int,
+    player: dict,
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    failed_task_ids: set[str] | None,
+    enemy_busy_task_ids: set[str] | None,
+    obstacle_nodes: set[str] | None,
+) -> str | None:
+    """对计划路径上、有顺路任务的前方节点使用情报（距离 ≤ INTEL_MAX_DISTANCE）。"""
+    route_tasks = _tasks_on_planned_route(
+        graph, current_node_id, goal_node_id, tasks, player_id, player,
+        weather, None, process_nodes, failed_task_ids, enemy_busy_task_ids,
+        obstacle_nodes,
+    )
+    if not route_tasks:
+        return None
+    if get_task_score(player) >= TASK_SCORE_TARGET:
+        return None
+    best_node = ""
+    best_dist = float("inf")
+    for task in route_tasks:
+        task_node = task.get("nodeId", "")
+        if not task_node or task_node == current_node_id:
+            continue
+        dist = graph.min_route_distance(current_node_id, task_node, weather, obstacle_nodes)
+        if dist == float("inf") or dist > INTEL_MAX_DISTANCE:
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best_node = task_node
+    return best_node or None
+
+
 def _try_use_intel(
     match_id: str,
     round_num: int,
@@ -3976,8 +4205,12 @@ def _try_use_intel(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
     gate_corridor_only: bool = False,
+    tasks: list[dict] | None = None,
+    failed_task_ids: set[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
+    obstacle_nodes: set[str] | None = None,
 ) -> dict | None:
-    """对计划路径上的处理站使用情报探路（距离 ≤15）。"""
+    """对计划路径上的处理站或顺路任务节点使用情报探路（距离 ≤15）。"""
     if not has_resource(player, "INTEL"):
         return None
     prof = _profile(map_gameplay)
@@ -3987,6 +4220,23 @@ def _try_use_intel(
         return None
     if not my_team_id:
         my_team_id = get_team_id(player)
+    if tasks:
+        task_target = _pick_intel_task_target(
+            graph, current_node_id, gate_node_id, tasks, player_id, player,
+            weather, process_nodes, failed_task_ids, enemy_busy_task_ids,
+            obstacle_nodes,
+        )
+        if task_target:
+            route_dist = graph.min_route_distance(
+                current_node_id, task_target, weather, obstacle_nodes,
+            )
+            logger.info(
+                "Round %d: Using INTEL on route task node %s (routeDist=%.1f)",
+                round_num, task_target, route_dist,
+            )
+            return make_action(match_id, round_num, player_id, [
+                make_use_resource_action("INTEL", task_target)
+            ])
     pick = _pick_scout_target(
         graph, current_node_id, gate_node_id, weather, None,
         process_nodes, processed_node_ids, visited_node_ids,
@@ -4248,6 +4498,10 @@ def _handle_use_resources(
     map_gameplay: MapGameplayContext | None = None,
     inquire_nodes: list[dict] | None = None,
     visited_node_ids: set[str] | None = None,
+    tasks: list[dict] | None = None,
+    failed_task_ids: set[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
+    obstacle_nodes: set[str] | None = None,
 ) -> dict | None:
     """Handle using resources: horses, intel (冰鉴由 _try_use_ice_box 优先处理)."""
     intel_action = _try_use_intel(
@@ -4259,6 +4513,10 @@ def _handle_use_resources(
         process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
         gate_corridor_only=get_task_score(player) >= TASK_SCORE_TARGET,
+        tasks=tasks,
+        failed_task_ids=failed_task_ids,
+        enemy_busy_task_ids=enemy_busy_task_ids,
+        obstacle_nodes=obstacle_nodes,
     )
     if intel_action is not None:
         return intel_action
