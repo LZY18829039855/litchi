@@ -471,6 +471,7 @@ def _decide_action_impl(
         "weather": weather,
         "route_blocked": route_blocked,
         "avoid_route_nodes": avoid_route_nodes,
+        "guard_blocked_targets": guard_blocked_targets,
         "guard_stuck_rounds": guard_stuck_rounds,
         "guard_stuck_target": guard_stuck_target,
         "process_nodes": process_nodes,
@@ -478,7 +479,7 @@ def _decide_action_impl(
     }
 
     if state != "CONTESTING" and not is_in_passive_state(player):
-        if not _should_defer_ice_box(player, last_move_error, route_blocked):
+        if not _should_defer_ice_box(player, last_move_error, route_blocked, guard_blocked_targets, avoid_route_nodes):
             ice_use = _try_use_ice_box(
                 match_id, round_num, player_id, player, map_gameplay,
                 phase=phase, force_delivery=force_delivery,
@@ -585,12 +586,26 @@ def _decide_action_impl(
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if next_node:
-                if next_node in route_blocked:
+                if next_node in guard_blocked_targets:
                     return _handle_limited_state_guard_block(
                         match_id, round_num, player_id, player, state,
                         next_node, last_move_failed, last_move_error,
                         inquire_nodes, my_team_id, guard_wait_kwargs,
                     )
+                if next_node in avoid_route_nodes:
+                    graph_obj = graph
+                    detour = _find_delivery_detour_step(
+                        graph_obj, current_node_id or "", player, gate_node_id,
+                        terminal_node_ids, weather, process_nodes, processed_node_ids,
+                        route_blocked, avoid_nodes=avoid_route_nodes,
+                    )
+                    if detour:
+                        logger.info(
+                            "Round %d: WAITING reroute via %s (avoid hop %s)",
+                            round_num, detour, next_node,
+                        )
+                        return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+                    return make_action(match_id, round_num, player_id, [make_wait_action()])
                 return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
             if current_node_id:
                 move_target = _find_move_target(
@@ -790,6 +805,17 @@ def _decide_action_impl(
     # --- Dual guard: only after task score target (unless gate fight) ---
     # (moved below task handling)
 
+    # --- Gate corridor monitor: weaken / reroute before chasing tasks ---
+    if can_act(player):
+        gate_action = _try_gate_corridor_guard_strategy(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids, weather,
+            inquire_nodes, my_team_id, route_blocked, avoid_route_nodes,
+            process_nodes, processed_node_ids,
+        )
+        if gate_action is not None:
+            return gate_action
+
     # --- P2/P3: Task strategy — 交付余量内尽可能多做顺路/小绕路任务 ---
     if not force_delivery:
         task_action = _handle_tasks(
@@ -805,6 +831,9 @@ def _decide_action_impl(
             delivery_slack=delivery_slack,
             map_gameplay=map_gameplay,
             task_claimed_this_stop=task_claimed_this_stop,
+            inquire_nodes=inquire_nodes,
+            my_team_id=my_team_id,
+            guard_blocked_targets=guard_blocked_targets,
         )
         if task_action is not None:
             return task_action
@@ -1102,22 +1131,143 @@ def _confirmed_obstacle(
     return node_id in obstacle_nodes
 
 
+def _collect_gate_corridor_enemy_guards(
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    player_id: int,
+) -> dict[str, dict]:
+    """Scan public state for active enemy guards on the gate corridor (S10-S14)."""
+    guarded: dict[str, dict] = {}
+    for node in inquire_nodes:
+        nid = node.get("nodeId", "")
+        if not nid or nid not in GATE_CORRIDOR_NODES:
+            continue
+        guard = node.get("guard")
+        if not isinstance(guard, dict):
+            continue
+        if is_enemy_guard(guard, my_team_id, player_id):
+            guarded[nid] = guard
+    return guarded
+
+
+def _node_has_enemy_guard(
+    inquire_nodes: list[dict],
+    node_id: str,
+    my_team_id: str,
+    player_id: int,
+) -> bool:
+    guard = _get_node_guard(inquire_nodes, node_id)
+    return is_enemy_guard(guard, my_team_id, player_id)
+
+
+def _gate_corridor_path_blocked(
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    weather: dict | None,
+    guard_nodes: set[str],
+    avoid_route_nodes: set[str],
+    process_nodes: dict[str, dict] | None = None,
+) -> bool:
+    """True when shortest path to gate must pass through a guarded corridor node."""
+    if not current_node_id or not gate_node_id or not guard_nodes:
+        return False
+    blocked = set(guard_nodes) | set(avoid_route_nodes)
+    direct = graph.shortest_path(current_node_id, gate_node_id, weather, blocked, process_nodes)
+    if direct:
+        return False
+    return bool(graph.shortest_path(current_node_id, gate_node_id, weather, avoid_route_nodes, process_nodes))
+
+
+def _try_gate_corridor_guard_strategy(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    route_blocked: set[str],
+    avoid_route_nodes: set[str],
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+) -> dict | None:
+    """React to corridor guards: weaken proactively or reroute before task/navigation."""
+    if not gate_node_id or not current_node_id:
+        return None
+    guarded = _collect_gate_corridor_enemy_guards(inquire_nodes, my_team_id, player_id)
+    if not guarded:
+        return None
+
+    guard_nodes = set(guarded)
+    path_blocked = _gate_corridor_path_blocked(
+        graph, current_node_id, gate_node_id, weather,
+        guard_nodes, avoid_route_nodes, process_nodes,
+    )
+
+    squad_count = get_squad_count(player)
+    if squad_count >= 2 and path_blocked:
+        best_nid = ""
+        best_defense = -1
+        for nid, guard in guarded.items():
+            defense = int(guard.get("defense", 0) or 0)
+            if defense > best_defense:
+                best_defense = defense
+                best_nid = nid
+        if best_nid:
+            logger.info(
+                "Round %d: Gate strategy: squad weaken at %s (corridor blocked, def=%d)",
+                round_num, best_nid, best_defense,
+            )
+            return make_action(match_id, round_num, player_id, [
+                make_squad_weaken_action(best_nid),
+            ])
+
+    if path_blocked:
+        detour = _find_delivery_detour_step(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+            weather, process_nodes, processed_node_ids, route_blocked,
+            avoid_nodes=avoid_route_nodes | guard_nodes,
+        )
+        if detour and detour not in guard_nodes:
+            logger.info(
+                "Round %d: Gate strategy: reroute via %s (corridor guards=%s)",
+                round_num, detour, sorted(guard_nodes),
+            )
+            return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+
+    return None
+
+
 def _is_paying_guard_travel_tax(
     state: str,
     player: dict,
     last_move_error: str,
     block_node: str,
     route_blocked: set[str],
+    guard_blocked_targets: set[str] | None = None,
+    avoid_route_nodes: set[str] | None = None,
 ) -> bool:
     """WAITING/MOVING 交设卡时间税时只能 WAIT/EMPTY，不能 BREAK/CLEAR。"""
     if last_move_error == "MOVING_ACTION_FORBIDDEN":
         return True
     if state != "WAITING":
         return False
+    guard_blocked = guard_blocked_targets or set()
+    avoid_nodes = avoid_route_nodes or set()
     next_node = player.get("nextNodeId", "")
-    if next_node and next_node in route_blocked:
+    if next_node:
+        if next_node in guard_blocked:
+            return True
+        if next_node in avoid_nodes and next_node not in guard_blocked:
+            return False
+    if block_node and block_node in guard_blocked:
         return True
-    return bool(block_node and block_node in route_blocked)
+    return False
 
 
 def _handle_limited_state_guard_block(
@@ -1135,12 +1285,52 @@ def _handle_limited_state_guard_block(
 ) -> dict:
     """Limited state handler: never BREAK/CLEAR while paying guard travel tax."""
     route_blocked = guard_wait_kwargs.get("route_blocked") or set()
-    if _is_paying_guard_travel_tax(state, player, last_move_error, block_node, route_blocked):
+    guard_blocked = guard_wait_kwargs.get("guard_blocked_targets") or set()
+    avoid_route_nodes = guard_wait_kwargs.get("avoid_route_nodes") or set()
+    if _is_paying_guard_travel_tax(
+        state, player, last_move_error, block_node, route_blocked,
+        guard_blocked_targets=guard_blocked,
+        avoid_route_nodes=avoid_route_nodes,
+    ):
         logger.info(
             "Round %d: %s paying guard tax at %s, WAIT only (no BREAK/CLEAR)",
             round_num, state, block_node,
         )
-        return make_action(match_id, round_num, player_id, [make_wait_action()])
+        msg = make_action(match_id, round_num, player_id, [make_wait_action()])
+        squad = _make_squad_weaken_action(
+            inquire_nodes, block_node, my_team_id, player_id, player,
+        )
+        if squad:
+            return _append_squad_action(msg, squad)
+        return msg
+
+    next_node = player.get("nextNodeId", "")
+    if (
+        state == "WAITING"
+        and next_node
+        and next_node in avoid_route_nodes
+        and next_node not in guard_blocked
+    ):
+        graph = guard_wait_kwargs.get("graph")
+        gate_node_id = guard_wait_kwargs.get("gate_node_id", "")
+        terminal_node_ids = guard_wait_kwargs.get("terminal_node_ids") or []
+        weather = guard_wait_kwargs.get("weather")
+        process_nodes = guard_wait_kwargs.get("process_nodes")
+        processed_node_ids = guard_wait_kwargs.get("processed_node_ids") or set()
+        current_node_id = get_current_node_id(player) or ""
+        if graph and current_node_id:
+            detour = _find_delivery_detour_step(
+                graph, current_node_id, player, gate_node_id, terminal_node_ids,
+                weather, process_nodes, processed_node_ids, route_blocked,
+                avoid_nodes=avoid_route_nodes,
+            )
+            if detour:
+                logger.info(
+                    "Round %d: WAITING detour via %s (avoid stuck hop %s)",
+                    round_num, detour, next_node,
+                )
+                return make_action(match_id, round_num, player_id, [make_move_action(detour)])
+
     return _wait_and_weaken_guard(
         match_id, round_num, player_id, player,
         inquire_nodes, block_node, my_team_id,
@@ -2631,9 +2821,9 @@ def _resolve_guard_block_target(
     route_blocked: set[str],
     guard_blocked_targets: set[str],
 ) -> str:
-    """Node blocking our in-progress move (next hop or known guard)."""
+    """Node blocking our in-progress move (next hop with active enemy guard)."""
     next_node = player.get("nextNodeId", "")
-    if next_node and next_node in route_blocked:
+    if next_node and next_node in guard_blocked_targets:
         return next_node
     return ""
 
@@ -2930,6 +3120,9 @@ def _handle_tasks(
     delivery_slack: float = 999.0,
     map_gameplay: MapGameplayContext | None = None,
     task_claimed_this_stop: bool = False,
+    inquire_nodes: list[dict] | None = None,
+    my_team_id: str = "",
+    guard_blocked_targets: set[str] | None = None,
 ) -> dict | None:
     """Handle task claiming strategy (策略文档 §5).
 
@@ -2949,6 +3142,12 @@ def _handle_tasks(
         enemy_busy_task_ids = set()
     if max_task_detour is None:
         max_task_detour = MAX_TASK_DETOUR_COST
+    if inquire_nodes is None:
+        inquire_nodes = []
+    if guard_blocked_targets is None:
+        guard_blocked_targets = set()
+    if not my_team_id:
+        my_team_id = get_team_id(player)
 
     water_nodes = _map_ctx(map_gameplay).water_route_nodes
     my_task_score = get_task_score(player)
@@ -3100,6 +3299,18 @@ def _handle_tasks(
                     round_num, task.get("taskId", ""), task_node, detour, delivery_slack,
                 )
                 continue
+            if _node_has_enemy_guard(inquire_nodes, task_node, my_team_id, my_player_id):
+                logger.info(
+                    "Round %d: Skip task %s at %s (enemy guard)",
+                    round_num, task.get("taskId", ""), task_node,
+                )
+                continue
+            if task_node in GATE_CORRIDOR_NODES and task_node in guard_blocked_targets:
+                logger.info(
+                    "Round %d: Skip task %s at %s (gate corridor blocked)",
+                    round_num, task.get("taskId", ""), task_node,
+                )
+                continue
             if not prefer_water and (
                 task_node in _map_ctx(map_gameplay).water_route_nodes
                 or (task.get("routeBucket") or "ROAD") == "WATER"
@@ -3118,10 +3329,14 @@ def _handle_tasks(
             candidates.sort(key=lambda x: (-x[2], x[1]))
             for best_task, _detour, _spr in candidates:
                 task_node = best_task.get("nodeId", "")
+                template_id = get_task_template_id(best_task)
                 soft_blocked = set(obstacle_nodes)
                 if blocked:
                     soft_blocked.update(blocked)
-                soft_blocked.discard(task_node)
+                if template_id.startswith("T04"):
+                    soft_blocked.discard(task_node)
+                elif task_node in soft_blocked:
+                    continue
                 step = graph.next_step_toward(
                     current_node_id, task_node, weather, soft_blocked,
                     use_weighted=True, process_nodes=process_nodes,
@@ -3132,6 +3347,8 @@ def _handle_tasks(
                         use_weighted=True, process_nodes=process_nodes,
                     )
                 if not step or step in visited_node_ids:
+                    continue
+                if step in soft_blocked or step in guard_blocked_targets:
                     continue
                 logger.info(
                     "Round %d: Moving toward task at %s (template=%s), step=%s",
@@ -3175,6 +3392,8 @@ def _should_defer_ice_box(
     player: dict,
     last_move_error: str,
     route_blocked: set[str],
+    guard_blocked_targets: set[str] | None = None,
+    avoid_route_nodes: set[str] | None = None,
 ) -> bool:
     """边上移动或交设卡税时不能 USE_RESOURCE，须落地后再用冰鉴。"""
     state = player.get("state", "")
@@ -3182,7 +3401,11 @@ def _should_defer_ice_box(
         return True
     if state == "WAITING":
         next_node = player.get("nextNodeId", "")
-        if _is_paying_guard_travel_tax(state, player, last_move_error, next_node, route_blocked):
+        if _is_paying_guard_travel_tax(
+            state, player, last_move_error, next_node, route_blocked,
+            guard_blocked_targets=guard_blocked_targets,
+            avoid_route_nodes=avoid_route_nodes,
+        ):
             return True
         if next_node:
             return True

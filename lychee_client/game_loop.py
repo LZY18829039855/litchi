@@ -11,7 +11,10 @@ from lychee_client.transport import encode_frame, read_frames_from_buffer
 from lychee_client.messages import parse_message, StartMessage, InquireMessage, OverMessage
 from lychee_client.map_graph import MapGraph
 from lychee_client.map_gameplay import MapGameplayContext, build_map_gameplay, default_map_gameplay
-from lychee_client.state import can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS, get_enemy_busy_task_ids
+from lychee_client.state import (
+    can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS,
+    get_enemy_busy_task_ids, GATE_CORRIDOR_NODES, is_enemy_guard,
+)
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
 
@@ -56,6 +59,7 @@ class GameClient:
         self.last_forced_pass_target = ""
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
+        self._gate_guard_seen: set[str] = set()
         self.last_node_id: str = ""
         self.task_claimed_this_stop: bool = False
         self.start_round: int = 1
@@ -257,21 +261,33 @@ class GameClient:
                 }
             if nid and (nid in self.guard_blocked_targets or nid in self.avoid_route_nodes):
                 guard = node.get("guard", {}) or {}
-                owner_team = guard.get("ownerTeamId") or guard.get("teamId", "")
-                owner_player = guard.get("playerId")
-                is_enemy_active = (
-                    guard.get("active", True) is not False
-                    and guard.get("defense", 0) > 0
-                    and (
-                        (owner_team and owner_team != player.get("teamId", ""))
-                        or (owner_player is not None and owner_player != self.player_id)
-                    )
-                )
-                if not is_enemy_active:
-                    self.guard_blocked_targets.discard(nid)
-                    logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
+                if not is_enemy_guard(guard, player.get("teamId", ""), self.player_id):
+                    if nid in self.guard_blocked_targets:
+                        self.guard_blocked_targets.discard(nid)
+                        logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
                 elif current_node_id and self.graph and nid in self.graph.get_neighbors(current_node_id):
                     self.guard_blocked_targets.add(nid)
+
+        # 关隘走廊全图监控：公开状态里一旦出现敌方设卡，立刻加入路由黑名单
+        my_team_id = player.get("teamId", "")
+        for node in inquire.nodes:
+            nid = node.get("nodeId", "")
+            if not nid or nid not in GATE_CORRIDOR_NODES:
+                continue
+            guard = node.get("guard", {}) or {}
+            if is_enemy_guard(guard, my_team_id, self.player_id):
+                if nid not in self._gate_guard_seen:
+                    defense = guard.get("defense", 0)
+                    logger.info(
+                        "Round %d: Gate monitor: enemy guard at %s (defense=%s)",
+                        inquire.round, nid, defense,
+                    )
+                    self._gate_guard_seen.add(nid)
+                self.guard_blocked_targets.add(nid)
+            elif nid in self._gate_guard_seen and nid not in self.avoid_route_nodes:
+                self.guard_blocked_targets.discard(nid)
+                self._gate_guard_seen.discard(nid)
+                logger.info("Round %d: Gate monitor: guard cleared at %s", inquire.round, nid)
 
         if current_node_id and self.graph:
             for node in inquire.nodes:
@@ -279,17 +295,7 @@ class GameClient:
                 if not nid or nid not in self.graph.get_neighbors(current_node_id):
                     continue
                 guard = node.get("guard", {}) or {}
-                owner_team = guard.get("ownerTeamId") or guard.get("teamId", "")
-                owner_player = guard.get("playerId")
-                is_enemy_active = (
-                    guard.get("active", True) is not False
-                    and guard.get("defense", 0) > 0
-                    and (
-                        (owner_team and owner_team != player.get("teamId", ""))
-                        or (owner_player is not None and owner_player != self.player_id)
-                    )
-                )
-                if is_enemy_active:
+                if is_enemy_guard(guard, player.get("teamId", ""), self.player_id):
                     self.guard_blocked_targets.add(nid)
 
         # Check last action result
