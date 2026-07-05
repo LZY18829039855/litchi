@@ -815,6 +815,14 @@ def _decide_action_impl(
     if ice_claim is not None:
         return ice_claim
 
+    horse_claim = None
+    if not delivery_critical:
+        horse_claim = _try_claim_horse(
+            match_id, round_num, player_id, player, current_node,
+        )
+    if horse_claim is not None:
+        return horse_claim
+
     if (
         not force_delivery
         and pending_task_hold_node_id == current_node_id
@@ -4360,6 +4368,30 @@ def _try_claim_ice_box(
     for rtype, _count in find_available_resources(current_node):
         if rtype == "ICE_BOX":
             logger.info("Round %d: Claiming ICE_BOX at %s", round_num, current_node_id)
+            return make_action(match_id, round_num, player_id, [
+                make_claim_resource_action(current_node_id, rtype)
+            ])
+    return None
+
+
+def _try_claim_horse(
+    match_id: str, round_num: int, player_id: int,
+    player: dict, current_node: dict | None,
+) -> dict | None:
+    """路途中遇到马类资源就领取，优先于任务，避免站台刷任务时遗漏。"""
+    if current_node is None or round_num >= 520:
+        return None
+    if has_resource(player, "FAST_HORSE"):
+        return None
+    current_node_id = current_node.get("nodeId", "")
+    for rtype, _count in find_available_resources(current_node):
+        if rtype == "FAST_HORSE":
+            logger.info("Round %d: Claiming FAST_HORSE at %s", round_num, current_node_id)
+            return make_action(match_id, round_num, player_id, [
+                make_claim_resource_action(current_node_id, rtype)
+            ])
+        if rtype == "SHORT_HORSE" and not has_resource(player, "SHORT_HORSE"):
+            logger.info("Round %d: Claiming SHORT_HORSE at %s", round_num, current_node_id)
             return make_action(match_id, round_num, player_id, [
                 make_claim_resource_action(current_node_id, rtype)
             ])
