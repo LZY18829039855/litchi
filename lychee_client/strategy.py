@@ -636,6 +636,7 @@ def _decide_action_impl(
                         current_node_id, tasks, failed_task_ids,
                         preferred_task_id=pending_task_hold_task_id,
                         enemy_busy_task_ids=enemy_busy_task_ids,
+                        map_gameplay=map_gameplay,
                     )
                     if task_retry is not None:
                         return task_retry
@@ -643,6 +644,7 @@ def _decide_action_impl(
                     match_id, round_num, player_id, player, graph,
                     current_node_id, tasks, failed_task_ids,
                     enemy_busy_task_ids=enemy_busy_task_ids,
+                    map_gameplay=map_gameplay,
                 )
                 if task_retry is not None:
                     return task_retry
@@ -699,7 +701,7 @@ def _decide_action_impl(
                     tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
                     enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
                     delivery_slack=delivery_slack, max_task_detour=max_task_detour,
-                    map_gameplay=map_gameplay,
+                    map_gameplay=map_gameplay, round_num=round_num,
                 )
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -766,6 +768,7 @@ def _decide_action_impl(
             current_node_id, tasks, failed_task_ids,
             preferred_task_id=pending_task_hold_task_id,
             enemy_busy_task_ids=enemy_busy_task_ids,
+            map_gameplay=map_gameplay,
         )
         if task_retry is not None:
             return task_retry
@@ -848,7 +851,7 @@ def _decide_action_impl(
                 tasks=tasks, player_id=player_id, failed_task_ids=failed_task_ids,
                 enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
                 delivery_slack=delivery_slack, max_task_detour=max_task_detour,
-                map_gameplay=map_gameplay,
+                map_gameplay=map_gameplay, round_num=round_num,
             )
             if move_target:
                 return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -1027,7 +1030,7 @@ def _decide_action_impl(
         enemy_busy_task_ids=enemy_busy_task_ids, phase=phase,
         force_delivery=force_delivery, delivery_slack=delivery_slack,
         max_task_detour=max_task_detour,
-        map_gameplay=map_gameplay,
+        map_gameplay=map_gameplay, round_num=round_num,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -2031,8 +2034,15 @@ def _use_horse_before_expensive_hop(
 def _should_use_task_aware_routing(
     player: dict, phase: str, force_delivery: bool,
     delivery_slack: float = 999.0,
+    round_num: int = 0,
 ) -> bool:
-    if delivery_slack <= 8:
+    if force_delivery:
+        return False
+    if round_num >= GATE_ENTRY_DEADLINE_ROUND:
+        return False
+    if round_num >= LATE_GAME_NO_MID_TASK_ROUND and get_task_score(player) >= TASK_SCORE_TARGET:
+        return False
+    if delivery_slack <= TASK_DETOUR_SLACK_RESERVE:
         return False
     return True
 
@@ -2229,8 +2239,16 @@ def _filter_neighbors_for_route_preference(
     current_node_id: str,
     prefer_water: bool,
     map_gameplay: MapGameplayContext | None = None,
+    force_delivery: bool = False,
+    gate_node_id: str = "",
+    terminal_node_ids: list[str] | None = None,
 ) -> list[str]:
     """未满足水路条件时尽量避开水路，已在链路上时不切断。"""
+    if terminal_node_ids is None:
+        terminal_node_ids = []
+    delivery_goals = {gate_node_id, *terminal_node_ids} - {""}
+    if force_delivery or any(n in delivery_goals for n in neighbors):
+        return neighbors
     if prefer_water or not neighbors:
         return neighbors
     ctx = _map_ctx(map_gameplay)
@@ -2503,6 +2521,7 @@ def _find_move_target(
     delivery_slack: float = 999.0,
     max_task_detour: int | None = None,
     map_gameplay: MapGameplayContext | None = None,
+    round_num: int = 0,
 ) -> str | None:
     """Find the best move target using weighted shortest path toward the current goal.
 
@@ -2536,13 +2555,22 @@ def _find_move_target(
     if forward_available:
         available = _filter_neighbors_for_route_preference(
             forward_available, current_node_id, prefer_water, map_gameplay,
+            force_delivery=force_delivery,
+            gate_node_id=gate_node_id,
+            terminal_node_ids=terminal_node_ids,
         )
     else:
         available = _filter_neighbors_for_route_preference(
             all_safe or neighbors, current_node_id, prefer_water, map_gameplay,
+            force_delivery=force_delivery,
+            gate_node_id=gate_node_id,
+            terminal_node_ids=terminal_node_ids,
         )
     all_safe = _filter_neighbors_for_route_preference(
         all_safe, current_node_id, prefer_water, map_gameplay,
+        force_delivery=force_delivery,
+        gate_node_id=gate_node_id,
+        terminal_node_ids=terminal_node_ids,
     ) or all_safe
     logger.info(
         "_find_move_target: current=%s neighbors=%s available=%s visited=%s prefer_water=%s",
@@ -2566,7 +2594,17 @@ def _find_move_target(
             if nid not in processed_node_ids
         }
 
-    if goal_node and _should_use_task_aware_routing(player, phase, force_delivery, delivery_slack):
+    if force_delivery and goal_node:
+        step = _find_direct_delivery_step(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+            weather, process_nodes, processed_node_ids,
+        )
+        if step:
+            return step
+
+    if goal_node and _should_use_task_aware_routing(
+        player, phase, force_delivery, delivery_slack, round_num=round_num,
+    ):
         if max_task_detour is None:
             max_task_detour = _max_task_detour_budget(delivery_slack, phase)
         task_candidates = all_safe or available
@@ -3138,6 +3176,7 @@ def _retry_task_at_current_node(
     failed_task_ids: set[str],
     preferred_task_id: str = "",
     enemy_busy_task_ids: set[str] | None = None,
+    map_gameplay: MapGameplayContext | None = None,
 ) -> dict | None:
     if enemy_busy_task_ids is None:
         enemy_busy_task_ids = set()
@@ -3178,6 +3217,17 @@ def _retry_task_at_current_node(
         return None
     template_id = get_task_template_id(task)
     if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
+        return None
+    prefer_water = _prefer_water_route(
+        player, tasks, player_id, failed_task_ids, enemy_busy_task_ids, set(),
+        map_gameplay=map_gameplay,
+    )
+    task_node = task.get("nodeId", current_node_id)
+    if not prefer_water and _is_water_task_location(task_node, task, map_gameplay):
+        logger.info(
+            "Round %d: Skip retry water task %s at %s (waterScore<%d)",
+            round_num, task_id, task_node, _water_task_min(map_gameplay),
+        )
         return None
     expire_round = task.get("expireRound", 0)
     if expire_round > 0 and round_num >= expire_round:
