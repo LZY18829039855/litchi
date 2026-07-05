@@ -239,13 +239,23 @@ def _pick_gate_step_off_node(
     gate_node_id: str,
     terminal_node_ids: list[str],
     weather: dict | None,
+    avoid_nodes: set[str] | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
 ) -> str | None:
     """Pick a non-terminal neighbor to leave the gate and regain IDLE."""
     terminal_set = set(terminal_node_ids or [])
-    candidates = [
-        nb for nb in graph.get_neighbors(current_node_id)
-        if nb not in terminal_set
-    ]
+    blocked = set(avoid_nodes or [])
+    processed = processed_node_ids or set()
+    candidates = []
+    for nb in graph.get_neighbors(current_node_id):
+        if nb in terminal_set or nb in blocked:
+            continue
+        if process_nodes and nb in process_nodes and nb not in processed:
+            pt = process_nodes[nb].get("processType", "")
+            if pt and not is_verify_process(pt):
+                continue
+        candidates.append(nb)
     if not candidates:
         return None
     best = candidates[0]
@@ -269,20 +279,18 @@ def _try_recover_gate_waiting(
     gate_node_id: str,
     terminal_node_ids: list[str],
     weather: dict | None,
+    own_guard_sites: set[str] | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
 ) -> dict | None:
-    """VERIFY_GATE is IDLE-only; MOVE off the gate to escape WAITING deadlock."""
+    """VERIFY_GATE is IDLE-only; WAIT at the gate until movement settles."""
     if not graph or not current_node_id or current_node_id != gate_node_id:
         return None
-    step = _pick_gate_step_off_node(
-        graph, current_node_id, gate_node_id, terminal_node_ids, weather,
-    )
-    if not step:
-        return None
     logger.info(
-        "Round %d: WAITING at unverified gate %s, MOVE to %s to regain IDLE for verify",
-        round_num, current_node_id, step,
+        "Round %d: WAITING at unverified gate %s, WAIT for IDLE verify",
+        round_num, current_node_id,
     )
-    return make_action(match_id, round_num, player_id, [make_move_action(step)])
+    return make_action(match_id, round_num, player_id, [make_wait_action()])
 
 
 def _decide_gate_verify_action(
@@ -748,10 +756,12 @@ def _decide_action_impl(
                         round_num, current_node_id,
                     )
                     return make_empty_action(match_id, round_num, player_id)
-                # VERIFY_GATE is IDLE-only; WAIT/EMPTY never leave WAITING — step off gate.
                 recover = _try_recover_gate_waiting(
                     match_id, round_num, player_id, graph,
                     current_node_id, gate_node_id, terminal_node_ids, weather,
+                    own_guard_sites=own_guard_sites,
+                    process_nodes=process_nodes,
+                    processed_node_ids=processed_node_ids,
                 )
                 if recover is not None:
                     return recover
@@ -958,6 +968,15 @@ def _decide_action_impl(
         )
         if task_retry is not None:
             return task_retry
+
+    process_first = _try_process_before_navigation(
+        match_id, round_num, player_id, player, current_node,
+        current_node_id, process_nodes, processed_node_ids, phase,
+        last_move_failed=last_move_failed, last_move_error=last_move_error,
+        own_guard_sites=own_guard_sites,
+    )
+    if process_first is not None:
+        return process_first
 
     leave_guard_action = _try_leave_own_guard_node(
         match_id, round_num, player_id, player, graph,
@@ -3423,6 +3442,71 @@ def _get_pending_station_process_type(
     return ""
 
 
+def _try_process_before_navigation(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    current_node: dict | None,
+    current_node_id: str | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str] | None,
+    phase: str,
+    last_move_failed: bool = False,
+    last_move_error: str = "",
+    own_guard_sites: set[str] | None = None,
+) -> dict | None:
+    """PROCESS before guard-leave or move when the server/map requires it."""
+    if not current_node_id:
+        return None
+    processed = processed_node_ids or set()
+    guard_sites = own_guard_sites or set()
+
+    if last_move_failed and last_move_error == "PROCESS_REQUIRED":
+        process_type = _get_process_type(current_node, process_nodes, current_node_id)
+        if process_type:
+            logger.info(
+                "Round %d: PROCESS_REQUIRED at %s, sending %s before move",
+                round_num, current_node_id, process_type,
+            )
+            return _make_process_action(
+                match_id, round_num, player_id,
+                process_type, current_node_id, phase,
+            )
+        logger.info(
+            "Round %d: PROCESS_REQUIRED at %s, sending PROCESS before move",
+            round_num, current_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [make_process_action(current_node_id)])
+
+    if current_node_id in processed:
+        return None
+
+    on_guard_site = current_node_id in guard_sites
+    if not on_guard_site:
+        return None
+
+    process_type = _get_process_type(current_node, process_nodes, current_node_id)
+    if not process_type or is_verify_process(process_type):
+        return None
+
+    if last_move_failed and last_move_error == "OBJECT_BUSY":
+        logger.info(
+            "Round %d: station process busy at %s, WAIT before retry",
+            round_num, current_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
+
+    logger.info(
+        "Round %d: station process required at %s before leaving guard, sending %s",
+        round_num, current_node_id, process_type,
+    )
+    return _make_process_action(
+        match_id, round_num, player_id,
+        process_type, current_node_id, phase,
+    )
+
+
 def _has_current_process_for_node(player: dict, current_node_id: str | None) -> bool:
     if not current_node_id:
         return False
@@ -5184,6 +5268,8 @@ def _evaluate_dual_guard_slot(
     process_nodes: dict[str, dict] | None = None,
 ) -> tuple[bool, str]:
     """Dual-guard plan: guard1 then guard2, each on opp path at a choke."""
+    if current_node_id in ("S13", "S14"):
+        return False, "delivery-path-no-guard"
     own_guards = _list_own_active_guard_nodes(inquire_nodes, my_team_id, player_id)
     if len(own_guards) >= MAX_ACTIVE_GUARDS:
         return False, "max-guards"
@@ -5360,6 +5446,8 @@ def _should_set_guard_dynamic(
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
     if not goal or not current_node_id:
         return False, ""
+    if current_node_id in ("S13", "S14"):
+        return False, "delivery-path-no-guard"
 
     if force_delivery:
         return False, "force-delivery"
@@ -5434,6 +5522,11 @@ def _try_leave_own_guard_node(
     """After SET_GUARD, leave the node via detour so we do not block ourselves."""
     if not current_node_id or current_node_id not in own_guard_sites:
         return None
+
+    if current_node_id not in processed_node_ids and process_nodes:
+        process_type = process_nodes.get(current_node_id, {}).get("processType", "")
+        if process_type and not is_verify_process(process_type):
+            return None
 
     if (
         gate_node_id
