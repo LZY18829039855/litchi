@@ -3037,6 +3037,7 @@ def _wait_and_weaken_guard(
     terminal_node_ids: list[str] | None = None,
     weather: dict | None = None,
     route_blocked: set[str] | None = None,
+    guard_blocked_targets: set[str] | None = None,
     avoid_route_nodes: set[str] | None = None,
     guard_stuck_rounds: int = 0,
     guard_stuck_target: str = "",
@@ -3046,6 +3047,8 @@ def _wait_and_weaken_guard(
     """WAIT (主车队) + SQUAD_WEAKEN (小分队) 每帧削弱设卡直到通行。"""
     if route_blocked is None:
         route_blocked = set()
+    if guard_blocked_targets is None:
+        guard_blocked_targets = set()
     if avoid_route_nodes is None:
         avoid_route_nodes = set()
     if processed_node_ids is None:
