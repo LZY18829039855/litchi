@@ -608,6 +608,24 @@ def _decide_action_impl(
 
         if state == "WAITING":
             next_node = player.get("nextNodeId", "")
+            if gate_node_id and current_node_id == gate_node_id and not is_verified(player):
+                if last_move_failed and last_move_error == "OBJECT_BUSY":
+                    logger.info(
+                        "Round %d: gate verify busy at %s, WAIT before retry",
+                        round_num, current_node_id,
+                    )
+                    return make_action(match_id, round_num, player_id, [make_wait_action()])
+                if phase == "RUSH" or (last_move_failed and last_move_error == "VERIFY_REQUIRED"):
+                    logger.info(
+                        "Round %d: waiting at unverified gate %s, retry VERIFY_GATE",
+                        round_num, current_node_id,
+                    )
+                    return _make_verify_gate_with_tactic(
+                        match_id, round_num, player_id, player, current_node_id,
+                        gate_node_id, inquire_nodes, my_team_id, process_nodes,
+                        verify_gate_plain_only=verify_gate_plain_only,
+                    )
+
             pending_process_type = _get_pending_station_process_type(
                 current_node_id, next_node, process_nodes, processed_node_ids,
             )
