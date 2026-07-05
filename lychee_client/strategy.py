@@ -928,6 +928,12 @@ def _decide_action_impl(
             weather, blocked_soft, inquire_nodes, process_nodes=process_nodes,
         )
 
+    horse_use = _use_horse_immediately(
+        match_id, round_num, player_id, player, current_node_id,
+    )
+    if horse_use is not None:
+        return horse_use
+
     # --- Dual guard: only after task score target (unless gate fight) ---
     # (moved below task handling)
 
@@ -1049,9 +1055,13 @@ def _decide_action_impl(
     # --- NAVIGATION: Move toward goal ---
     if round_num <= EARLY_GAME_MAX_ROUND:
         early_move = _try_early_start_move(
-            match_id, round_num, player_id, graph,
-            current_node_id, gate_node_id, obstacle_nodes,
-            visited_node_ids, map_gameplay,
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
+            obstacle_nodes, visited_node_ids, map_gameplay,
+            tasks=tasks, weather=weather, process_nodes=process_nodes,
+            failed_task_ids=failed_task_ids,
+            enemy_busy_task_ids=enemy_busy_task_ids,
+            max_task_detour=max_task_detour,
         )
         if early_move is not None:
             return early_move
@@ -2090,6 +2100,35 @@ def _use_horse_before_expensive_hop(
     return None
 
 
+def _use_horse_immediately(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    current_node_id: str,
+) -> dict | None:
+    """Use a held horse as soon as possible; horse buffs do not stack."""
+    if _has_move_speed_buff(player):
+        return None
+    if has_resource(player, "FAST_HORSE"):
+        logger.info(
+            "Round %d: Immediately using FAST_HORSE at %s",
+            round_num, current_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("FAST_HORSE")
+        ])
+    if has_resource(player, "SHORT_HORSE"):
+        logger.info(
+            "Round %d: Immediately using SHORT_HORSE at %s",
+            round_num, current_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("SHORT_HORSE")
+        ])
+    return None
+
+
 def _should_use_task_aware_routing(
     player: dict, phase: str, force_delivery: bool,
     delivery_slack: float = 999.0,
@@ -2245,14 +2284,22 @@ def _try_early_start_move(
     match_id: str,
     round_num: int,
     player_id: int,
+    player: dict,
     graph: MapGraph,
     current_node_id: str,
     gate_node_id: str,
+    terminal_node_ids: list[str],
     obstacle_nodes: set[str],
     visited_node_ids: set[str],
     map_gameplay: MapGameplayContext | None,
+    tasks: list[dict] | None = None,
+    weather: dict | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    failed_task_ids: set[str] | None = None,
+    enemy_busy_task_ids: set[str] | None = None,
+    max_task_detour: int | None = None,
 ) -> dict | None:
-    """开局优先走水路方向，避免绕向障碍节点。"""
+    """开局先按任务收益选路；没有任务信号时再回退到水路方向。"""
     ctx = _map_ctx(map_gameplay)
     if round_num > EARLY_GAME_MAX_ROUND:
         return None
@@ -2260,11 +2307,44 @@ def _try_early_start_move(
         return None
     if len(visited_node_ids) > 1:
         return None
+    tasks = tasks or []
+    failed_task_ids = failed_task_ids or set()
+    enemy_busy_task_ids = enemy_busy_task_ids or set()
+    candidates = [
+        n for n in graph.get_neighbors(current_node_id)
+        if n not in obstacle_nodes and n not in visited_node_ids
+    ]
+    if not candidates:
+        return None
+
+    if tasks and gate_node_id:
+        task_step = _pick_task_aware_neighbor(
+            graph, current_node_id, candidates, gate_node_id,
+            tasks, player_id, player, gate_node_id, terminal_node_ids,
+            weather, None, process_nodes, failed_task_ids,
+            enemy_busy_task_ids, obstacle_nodes, visited_node_ids,
+            max_task_detour=max_task_detour,
+            prefer_water=True,
+            map_gameplay=map_gameplay,
+        )
+        if task_step:
+            route_score, route_tasks, route_high = _route_task_stats(
+                graph, current_node_id, task_step, gate_node_id,
+                tasks, player_id, player, gate_node_id, terminal_node_ids,
+                weather, None, process_nodes, failed_task_ids,
+                enemy_busy_task_ids, obstacle_nodes,
+                max_task_detour=max_task_detour,
+            )
+            if route_score > 0:
+                logger.info(
+                    "Round %d: early task-aware move via %s (routeTasks=%d high=%d score=%d)",
+                    round_num, task_step, route_tasks, route_high, route_score,
+                )
+                return make_action(match_id, round_num, player_id, [make_move_action(task_step)])
+
     best: str | None = None
     best_score = float("inf")
-    for neighbor in graph.get_neighbors(current_node_id):
-        if neighbor in obstacle_nodes:
-            continue
+    for neighbor in candidates:
         water_hops = float("inf")
         for w in ctx.water_route_nodes:
             h = graph.path_length(neighbor, w, None, obstacle_nodes)
