@@ -395,6 +395,18 @@ class GameClient:
                     if last_error == "INVALID_ACTION_TYPE" and ar.get("action") == "RUSH_SPEED":
                         self.rush_speed_failed = True
                         logger.info("Round %d: RUSH_SPEED rejected as INVALID_ACTION_TYPE, disabling", inquire.round)
+                    if last_error == "INVALID_ACTION_TYPE" and ar.get("action") == "VERIFY_GATE":
+                        if inquire.phase == "RUSH":
+                            self.verify_gate_plain_only = True
+                            logger.info(
+                                "Round %d: VERIFY_GATE rejected as INVALID_ACTION_TYPE in RUSH, retry plain",
+                                inquire.round,
+                            )
+                        else:
+                            logger.info(
+                                "Round %d: VERIFY_GATE rejected before RUSH, waiting for phase transition",
+                                inquire.round,
+                            )
                     if (
                         last_error == "RUSH_TACTIC_INVALID_BINDING"
                         and ar.get("action") == "VERIFY_GATE"
@@ -487,6 +499,18 @@ class GameClient:
                 if last_error == "INVALID_ACTION_TYPE" and payload.get("action") == "RUSH_SPEED":
                     self.rush_speed_failed = True
                     logger.info("Round %d: RUSH_SPEED INVALID_ACTION_TYPE (from event), disabling", inquire.round)
+                if last_error == "INVALID_ACTION_TYPE" and payload.get("action") == "VERIFY_GATE":
+                    if inquire.phase == "RUSH":
+                        self.verify_gate_plain_only = True
+                        logger.info(
+                            "Round %d: VERIFY_GATE INVALID_ACTION_TYPE in RUSH (from event), retry plain",
+                            inquire.round,
+                        )
+                    else:
+                        logger.info(
+                            "Round %d: VERIFY_GATE INVALID_ACTION_TYPE before RUSH (from event), waiting",
+                            inquire.round,
+                        )
                 if (
                     last_error == "RUSH_TACTIC_INVALID_BINDING"
                     and payload.get("action") == "VERIFY_GATE"

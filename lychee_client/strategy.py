@@ -615,7 +615,7 @@ def _decide_action_impl(
                         round_num, current_node_id,
                     )
                     return make_action(match_id, round_num, player_id, [make_wait_action()])
-                if phase == "RUSH" or (last_move_failed and last_move_error == "VERIFY_REQUIRED"):
+                if phase == "RUSH":
                     logger.info(
                         "Round %d: waiting at unverified gate %s, retry VERIFY_GATE",
                         round_num, current_node_id,
@@ -625,6 +625,11 @@ def _decide_action_impl(
                         gate_node_id, inquire_nodes, my_team_id, process_nodes,
                         verify_gate_plain_only=verify_gate_plain_only,
                     )
+                logger.info(
+                    "Round %d: waiting at unverified gate %s until RUSH",
+                    round_num, current_node_id,
+                )
+                return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             pending_process_type = _get_pending_station_process_type(
                 current_node_id, next_node, process_nodes, processed_node_ids,
@@ -848,8 +853,11 @@ def _decide_action_impl(
                 gate_node_id, inquire_nodes, my_team_id, process_nodes,
                 verify_gate_plain_only=verify_gate_plain_only,
             )
-        # Not RUSH yet: don't submit VERIFY_GATE (will be rejected)
-        # Continue doing other things until RUSH
+        logger.info(
+            "Round %d: at unverified gate %s before RUSH, waiting",
+            round_num, current_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
 
     # --- Fixed processing (策略文档 §4.1: 再次到达同一站需重新处理) ---
     # Process at current node ONLY if not already processed this visit.
