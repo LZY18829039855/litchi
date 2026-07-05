@@ -36,6 +36,7 @@ from lychee_client.state import (
     ICE_BOX_FRESHNESS_THRESHOLD, RUSH_PROTECT_FRESHNESS,
     RESOURCE_CLAIM_PRIORITY, TASK_PRIORITY, MAX_ROUND,
     SQUAD_CLEAR_COST, SQUAD_RESERVE_FOR_LATE, SQUAD_CLEAR_MIN_SQUAD,
+    SQUAD_CLEAR_NEXT_HOP_MIN_SQUAD,
     GATE_CORRIDOR_NODES, GATE_CORRIDOR_ORDER, GATE_CORRIDOR_SQUAD_MIN,
     MAX_ACTIVE_GUARDS, GUARD_GOOD_FRUIT_RESERVE, GUARD_MIN_LEAD_FIRST,
     GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
@@ -112,6 +113,21 @@ def _gate_verify_frames(process_nodes: dict[str, dict] | None, gate_node_id: str
         if is_verify_process(pt):
             return int(info.get("processRound") or PROCESS_COST_FRAMES.get("VERIFY", 6) or 6)
     return int(PROCESS_COST_FRAMES.get("VERIFY", 6) or 6)
+
+
+def _must_wait_for_gate_verify(
+    player: dict,
+    gate_node_id: str,
+    current_node_id: str | None,
+    last_move_failed: bool = False,
+    last_move_error: str = "",
+) -> bool:
+    """True when still at the gate and server/client agree verification is pending."""
+    if not gate_node_id or not current_node_id or current_node_id != gate_node_id:
+        return False
+    if last_move_failed and last_move_error == "VERIFY_REQUIRED":
+        return True
+    return not is_verified(player)
 
 
 def _is_delivery_critical(
@@ -608,27 +624,27 @@ def _decide_action_impl(
 
         if state == "WAITING":
             next_node = player.get("nextNodeId", "")
-            if gate_node_id and current_node_id == gate_node_id and not is_verified(player):
+            if _must_wait_for_gate_verify(
+                player, gate_node_id, current_node_id, last_move_failed, last_move_error,
+            ):
                 if last_move_failed and last_move_error == "OBJECT_BUSY":
                     logger.info(
                         "Round %d: gate verify busy at %s, WAIT before retry",
                         round_num, current_node_id,
                     )
                     return make_action(match_id, round_num, player_id, [make_wait_action()])
+                # VERIFY_GATE is IDLE-only (任务书 §8.2); WAITING must hold until IDLE.
                 if phase == "RUSH":
                     logger.info(
-                        "Round %d: waiting at unverified gate %s, retry VERIFY_GATE",
+                        "Round %d: WAITING at unverified gate %s in RUSH, "
+                        "WAIT for IDLE verify (last=%s)",
+                        round_num, current_node_id, last_move_error or "pending",
+                    )
+                else:
+                    logger.info(
+                        "Round %d: WAITING at unverified gate %s until RUSH",
                         round_num, current_node_id,
                     )
-                    return _make_verify_gate_with_tactic(
-                        match_id, round_num, player_id, player, current_node_id,
-                        gate_node_id, inquire_nodes, my_team_id, process_nodes,
-                        verify_gate_plain_only=verify_gate_plain_only,
-                    )
-                logger.info(
-                    "Round %d: waiting at unverified gate %s until RUSH",
-                    round_num, current_node_id,
-                )
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             pending_process_type = _get_pending_station_process_type(
@@ -757,6 +773,14 @@ def _decide_action_impl(
                     )
 
         if state == "MOVING":
+            if _must_wait_for_gate_verify(
+                player, gate_node_id, current_node_id, last_move_failed, last_move_error,
+            ):
+                logger.info(
+                    "Round %d: MOVING at unverified gate %s, WAIT for IDLE verify",
+                    round_num, current_node_id,
+                )
+                return make_action(match_id, round_num, player_id, [make_wait_action()])
             if guard_target or (
                 last_move_failed
                 and last_move_error in ("MOVE_BLOCKED_BY_GUARD", "MOVING_ACTION_FORBIDDEN")
@@ -845,8 +869,10 @@ def _decide_action_impl(
         # At S15, verified but no good fruit/freshness → WAIT (can't deliver)
         return make_empty_action(match_id, round_num, player_id)
 
-    # At S14 (gate): VERIFY_GATE in RUSH phase
-    if gate_node_id and is_at_node(player, gate_node_id) and not is_verified(player):
+    # At S14 (gate): VERIFY_GATE in RUSH phase (IDLE only)
+    if gate_node_id and is_at_node(player, gate_node_id) and _must_wait_for_gate_verify(
+        player, gate_node_id, current_node_id, last_move_failed, last_move_error,
+    ):
         if phase == "RUSH":
             return _make_verify_gate_with_tactic(
                 match_id, round_num, player_id, player, current_node_id,
@@ -1777,6 +1803,12 @@ def _plan_limited_state_force_delivery_move(
     avoid_route_nodes: set[str],
 ) -> dict | None:
     """WAITING/MOVING 下 force delivery：仅 MOVE/WAIT/马类（任务书 §8.2）。"""
+    if _must_wait_for_gate_verify(player, gate_node_id, current_node_id):
+        logger.info(
+            "Round %d: limited force delivery blocked at unverified gate %s, WAIT",
+            round_num, current_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
     next_node = player.get("nextNodeId", "")
     if next_node:
         if next_node in route_blocked:
@@ -2673,6 +2705,9 @@ def _find_move_target(
         processed_node_ids = set()
     if visited_node_ids is None:
         visited_node_ids = set()
+
+    if _must_wait_for_gate_verify(player, gate_node_id, current_node_id):
+        return None
 
     neighbors = graph.get_neighbors(current_node_id)
     if not neighbors:
@@ -4026,10 +4061,13 @@ def _squad_clear_allowed(
     gate_node_id: str,
     graph: MapGraph | None,
     weather: dict | None,
+    is_next_hop: bool = False,
 ) -> bool:
     """统一的小分队清障时机判断。"""
     if not on_my_path:
         return False
+    if is_next_hop:
+        return True
     if force_delivery:
         return True
     if node_id in GATE_CORRIDOR_NODES:
@@ -4299,24 +4337,143 @@ def _path_nodes_to_goal(
     return path or []
 
 
+def _get_planned_next_hop(
+    graph: MapGraph,
+    current_node_id: str,
+    goal_node_id: str,
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None = None,
+) -> str | None:
+    """Preferred weighted next hop toward goal (before obstacle avoidance reroute)."""
+    if not current_node_id or not goal_node_id or current_node_id == goal_node_id:
+        return None
+    return graph.next_step_toward(
+        current_node_id, goal_node_id, weather, None,
+        use_weighted=True, process_nodes=process_nodes,
+    )
+
+
+def _node_is_route_obstacle(
+    node_id: str,
+    inquire_nodes: list[dict],
+    obstacle_nodes: set[str],
+) -> bool:
+    if node_id in obstacle_nodes:
+        return True
+    node = _get_inquire_node(inquire_nodes, node_id)
+    return node is not None and node_has_obstacle(node)
+
+
+def _min_squad_for_clear_node(node_id: str, *, is_next_hop: bool) -> int:
+    if node_id in GATE_CORRIDOR_NODES:
+        return GATE_CORRIDOR_SQUAD_MIN
+    if is_next_hop:
+        return SQUAD_CLEAR_NEXT_HOP_MIN_SQUAD
+    return SQUAD_CLEAR_MIN_SQUAD
+
+
+def _can_squad_clear_obstacle(
+    node_id: str,
+    *,
+    is_next_hop: bool,
+    on_my_path: bool,
+    round_num: int,
+    force_delivery: bool,
+    current_node_id: str,
+    gate_node_id: str,
+    graph: MapGraph | None,
+    weather: dict | None,
+    tasks: list[dict],
+    failed_task_ids: set[str],
+    my_task_score: int,
+    squad_count: int,
+) -> bool:
+    if not _squad_clear_allowed(
+        round_num, node_id, on_my_path, force_delivery,
+        current_node_id, gate_node_id, graph, weather,
+        is_next_hop=is_next_hop,
+    ):
+        return False
+    if (
+        node_id not in GATE_CORRIDOR_NODES
+        and _node_has_planned_t04(tasks, node_id, failed_task_ids, my_task_score)
+    ):
+        return False
+    return squad_count >= _min_squad_for_clear_node(node_id, is_next_hop=is_next_hop)
+
+
+def _find_next_hop_obstacle_clear_target(
+    graph: MapGraph,
+    current_node_id: str,
+    goal_node_id: str,
+    inquire_nodes: list[dict],
+    obstacle_nodes: set[str],
+    weather: dict | None,
+    tasks: list[dict],
+    failed_task_ids: set[str],
+    my_task_score: int,
+    squad_count: int,
+    squad_clear_pending: set[str],
+    round_num: int = 0,
+    force_delivery: bool = False,
+    gate_node_id: str = "",
+    process_nodes: dict[str, dict] | None = None,
+) -> str | None:
+    """Prioritize clearing an obstacle on the immediate planned next hop."""
+    if squad_count < GATE_CORRIDOR_SQUAD_MIN:
+        return None
+    next_hop = _get_planned_next_hop(
+        graph, current_node_id, goal_node_id, weather, process_nodes,
+    )
+    if not next_hop or next_hop == current_node_id or next_hop in squad_clear_pending:
+        return None
+    if not _node_is_route_obstacle(next_hop, inquire_nodes, obstacle_nodes):
+        return None
+    my_path = _path_nodes_to_goal(
+        graph, current_node_id, goal_node_id, weather, obstacle_nodes,
+    )
+    on_my_path = next_hop in my_path
+    if not _can_squad_clear_obstacle(
+        next_hop,
+        is_next_hop=True,
+        on_my_path=on_my_path,
+        round_num=round_num,
+        force_delivery=force_delivery,
+        current_node_id=current_node_id,
+        gate_node_id=gate_node_id or goal_node_id,
+        graph=graph,
+        weather=weather,
+        tasks=tasks,
+        failed_task_ids=failed_task_ids,
+        my_task_score=my_task_score,
+        squad_count=squad_count,
+    ):
+        return None
+    return next_hop
+
+
 def _score_squad_clear_target(
     node_id: str,
     my_path: list[str],
     opp_path: list[str],
     obstacle_candidate_node_ids: frozenset[str] | None = None,
+    next_hop_id: str = "",
 ) -> float:
     """Higher score = more valuable to clear on own route only."""
     on_my_path = node_id in my_path
     if not on_my_path:
         return 0.0
     if node_id in GATE_CORRIDOR_NODES:
-        return 25.0
-    score = 12.0
+        score = 25.0
+    else:
+        score = 12.0
     on_opp_path = bool(opp_path) and node_id in opp_path
     if on_my_path and on_opp_path:
         score += 4.0
     if obstacle_candidate_node_ids and node_id in obstacle_candidate_node_ids:
         score += 6.0
+    if next_hop_id and node_id == next_hop_id:
+        score += 50.0
     return score
 
 
@@ -4337,14 +4494,31 @@ def _find_squad_clear_target(
     round_num: int = 0,
     force_delivery: bool = False,
     gate_node_id: str = "",
+    process_nodes: dict[str, dict] | None = None,
 ) -> str | None:
     """Pick obstacle node for SQUAD_CLEAR on own route with unified timing gates."""
     if squad_count < GATE_CORRIDOR_SQUAD_MIN:
         return None
 
+    next_hop_clear = _find_next_hop_obstacle_clear_target(
+        graph, current_node_id, goal_node_id, inquire_nodes, obstacle_nodes,
+        weather, tasks, failed_task_ids, my_task_score, squad_count,
+        squad_clear_pending, round_num=round_num, force_delivery=force_delivery,
+        gate_node_id=gate_node_id, process_nodes=process_nodes,
+    )
+    if next_hop_clear:
+        logger.info(
+            "Round %d: Priority next-hop squad clear at %s (squad=%d)",
+            round_num, next_hop_clear, squad_count,
+        )
+        return next_hop_clear
+
     ctx = _map_ctx(map_gameplay)
     my_path = _path_nodes_to_goal(
         graph, current_node_id, goal_node_id, weather, obstacle_nodes,
+    )
+    planned_next_hop = _get_planned_next_hop(
+        graph, current_node_id, goal_node_id, weather, process_nodes,
     )
     opp_path: list[str] = []
     if opp_player:
@@ -4363,29 +4537,45 @@ def _find_squad_clear_target(
         if not nid or nid == current_node_id or nid in squad_clear_pending:
             continue
         on_my_path = nid in my_path
+        is_next_hop = nid == planned_next_hop
         if not _squad_clear_allowed(
             round_num, nid, on_my_path, force_delivery,
             current_node_id, gate_node_id or goal_node_id, graph, weather,
+            is_next_hop=is_next_hop,
         ):
             continue
-        if nid not in GATE_CORRIDOR_NODES and _node_has_planned_t04(tasks, nid, failed_task_ids, my_task_score):
+        if not _can_squad_clear_obstacle(
+            nid,
+            is_next_hop=is_next_hop,
+            on_my_path=on_my_path,
+            round_num=round_num,
+            force_delivery=force_delivery,
+            current_node_id=current_node_id,
+            gate_node_id=gate_node_id or goal_node_id,
+            graph=graph,
+            weather=weather,
+            tasks=tasks,
+            failed_task_ids=failed_task_ids,
+            my_task_score=my_task_score,
+            squad_count=squad_count,
+        ):
             continue
 
         score = _score_squad_clear_target(
             nid, my_path, opp_path, ctx.obstacle_candidate_node_ids,
+            next_hop_id=planned_next_hop or "",
         )
-        if nid in GATE_CORRIDOR_NODES:
-            min_squad = GATE_CORRIDOR_SQUAD_MIN
-        else:
-            min_squad = SQUAD_CLEAR_MIN_SQUAD
-        if squad_count < min_squad:
-            continue
         if score <= 0:
             continue
 
-        if nid not in GATE_CORRIDOR_NODES and squad_count <= SQUAD_CLEAR_MIN_SQUAD + 1 and score < 12.0:
+        if (
+            not is_next_hop
+            and nid not in GATE_CORRIDOR_NODES
+            and squad_count <= SQUAD_CLEAR_MIN_SQUAD + 1
+            and score < 12.0
+        ):
             continue
-        if nid not in GATE_CORRIDOR_NODES and score < 9.0:
+        if not is_next_hop and nid not in GATE_CORRIDOR_NODES and score < 9.0:
             continue
 
         if score > best_score:
@@ -4851,16 +5041,7 @@ def _handle_combat(
         my_task_score = get_task_score(player)
         scout_min = _profile(map_gameplay).squad_scout_min_squad
 
-        scout_action = _try_squad_scout(
-            match_id, round_num, player_id, graph,
-            current_node_id, gate_node_id or goal, weather,
-            process_nodes, processed_node_ids, visited_node_ids,
-            inquire_nodes, my_team_id, squad_count, scout_min, my_task_score,
-        )
-        if scout_action is not None:
-            return scout_action
-
-        # SQUAD_CLEAR: own-route obstacles only (unified timing gates).
+        # SQUAD_CLEAR before scout: prioritize next-hop obstacles on own route.
         if squad_count >= GATE_CORRIDOR_SQUAD_MIN and goal:
             clear_target = _find_squad_clear_target(
                 graph, current_node_id, goal, inquire_nodes, obstacle_nodes,
@@ -4868,6 +5049,7 @@ def _handle_combat(
                 squad_count, squad_clear_pending, map_gameplay,
                 round_num=round_num, force_delivery=False,
                 gate_node_id=gate_node_id or goal,
+                process_nodes=process_nodes,
             )
             if clear_target:
                 logger.info(
@@ -4877,6 +5059,15 @@ def _handle_combat(
                 return make_action(match_id, round_num, player_id, [
                     make_squad_clear_action(clear_target)
                 ])
+
+        scout_action = _try_squad_scout(
+            match_id, round_num, player_id, graph,
+            current_node_id, gate_node_id or goal, weather,
+            process_nodes, processed_node_ids, visited_node_ids,
+            inquire_nodes, my_team_id, squad_count, scout_min, my_task_score,
+        )
+        if scout_action is not None:
+            return scout_action
 
         # SQUAD_REINFORCE: Reinforce our own guard at final corridor key nodes first
         if squad_count >= SQUAD_CLEAR_MIN_SQUAD:

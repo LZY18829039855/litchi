@@ -225,6 +225,8 @@ class GameClient:
                 self.last_claimed_task_score_before,
                 current_score,
             )
+            self.last_claimed_task_score_before = current_score
+            self.task_claimed_this_stop = False
             return
 
         if isinstance(player.get("currentProcess"), dict):
