@@ -46,6 +46,7 @@ class GameClient:
         self.visited_node_ids: set[str] = set()  # all nodes ever visited (for navigation, avoid backtracking)
         self.failed_task_ids: set[str] = set()  # tasks rejected with RESOURCE_NOT_ENOUGH (skip retry)
         self.rush_speed_failed = False  # RUSH_SPEED rejected with INVALID_ACTION_TYPE (skip retry)
+        self.verify_gate_plain_only = False  # after RUSH_TACTIC_INVALID_BINDING, omit rushTactic on VERIFY_GATE
         self.last_claimed_task_id = ""  # track last CLAIM_TASK taskId for failed_task_ids
         self.last_claimed_task_node_id = ""
         self.pending_task_hold_task_id = ""
@@ -311,6 +312,15 @@ class GameClient:
                     if last_error == "INVALID_ACTION_TYPE" and ar.get("action") == "RUSH_SPEED":
                         self.rush_speed_failed = True
                         logger.info("Round %d: RUSH_SPEED rejected as INVALID_ACTION_TYPE, disabling", inquire.round)
+                    if (
+                        last_error == "RUSH_TACTIC_INVALID_BINDING"
+                        and ar.get("action") == "VERIFY_GATE"
+                    ):
+                        self.verify_gate_plain_only = True
+                        logger.info(
+                            "Round %d: VERIFY_GATE rushTactic rejected, retry plain VERIFY_GATE",
+                            inquire.round,
+                        )
                     # Track CLAIM_TASK business rejections that should not be retried.
                     # Note: actionResults doesn't include taskId, use last_claimed_task_id
                     if (
@@ -319,6 +329,7 @@ class GameClient:
                             "RESOURCE_NOT_ENOUGH",
                             "TASK_REQUIREMENT_NOT_MET",
                             "TASK_EXPIRED",
+                            "TASK_NOT_FOUND",
                             "WINDOW_DRAW_RETRY_LIMIT",
                         }
                     ):
@@ -392,6 +403,15 @@ class GameClient:
                 if last_error == "INVALID_ACTION_TYPE" and payload.get("action") == "RUSH_SPEED":
                     self.rush_speed_failed = True
                     logger.info("Round %d: RUSH_SPEED INVALID_ACTION_TYPE (from event), disabling", inquire.round)
+                if (
+                    last_error == "RUSH_TACTIC_INVALID_BINDING"
+                    and payload.get("action") == "VERIFY_GATE"
+                ):
+                    self.verify_gate_plain_only = True
+                    logger.info(
+                        "Round %d: VERIFY_GATE rushTactic rejected (from event), retry plain",
+                        inquire.round,
+                    )
                 # Track CLAIM_TASK business rejections from events.
                 if (
                     payload.get("action") == "CLAIM_TASK"
@@ -399,6 +419,7 @@ class GameClient:
                         "RESOURCE_NOT_ENOUGH",
                         "TASK_REQUIREMENT_NOT_MET",
                         "TASK_EXPIRED",
+                        "TASK_NOT_FOUND",
                         "WINDOW_DRAW_RETRY_LIMIT",
                     }
                 ):
@@ -477,6 +498,8 @@ class GameClient:
                     if node_id:
                         self.processed_node_ids.add(node_id)
                         logger.debug("Round %d: Process complete at %s", inquire.round, node_id)
+                    if ev_type == "VERIFY_GATE_COMPLETE":
+                        self.verify_gate_plain_only = False
             # Cache contest ID when window contest starts
             if ev_type == "WINDOW_CONTEST_START":
                 cid = payload.get("contestId", "")
@@ -578,6 +601,7 @@ class GameClient:
             own_guard_sites=self.own_guard_sites,
             map_gameplay=self.map_gameplay,
             task_claimed_this_stop=self.task_claimed_this_stop,
+            verify_gate_plain_only=self.verify_gate_plain_only,
         )
 
         self.send_message(action_msg)

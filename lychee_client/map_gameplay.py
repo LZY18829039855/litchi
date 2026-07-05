@@ -43,8 +43,8 @@ PUBLIC_PROFILE = MapStrategyProfile(
     water_route_task_min=55,
     require_ice_for_water=False,
     squad_scout_min_squad=3,
-    force_delivery_slack_buffer=28.0,
-    guard_min_task_score=90,
+    force_delivery_slack_buffer=45.0,
+    guard_min_task_score=999,
 )
 
 VARIANT_PROFILE = MapStrategyProfile(

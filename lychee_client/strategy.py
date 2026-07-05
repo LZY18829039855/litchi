@@ -41,12 +41,13 @@ from lychee_client.state import (
     GUARD_STUCK_AVOID_ROUNDS, GUARD_SILENT_WAIT_LIMIT,
     GUARD_RESERVE_FOR_GATE, FINAL_CORRIDOR_GATE_HOPS,
     FINAL_CORRIDOR_GUARD_MIN_LEAD, FINAL_CORRIDOR_GUARD_TASK_MIN,
-    ICE_BOX_NEAR_GATE_HOPS, GATE_ENTRY_DEADLINE_ROUND, EARLY_GAME_MAX_ROUND,
+    ICE_BOX_NEAR_GATE_HOPS, GATE_ENTRY_DEADLINE_ROUND, GATE_ARRIVAL_TARGET_ROUND,
+    EARLY_GAME_MAX_ROUND,
     SQUAD_CLEAR_MIN_ROUND, SQUAD_CLEAR_MIDMAP_MIN_ROUND, LATE_GAME_NO_MID_TASK_ROUND,
     SCOUT_MARKER_VALID_FRAMES, SQUAD_SCOUT_MIN_DELAY, SQUAD_SCOUT_MAX_DELAY,
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
     FORCE_DELIVERY_ETA_REMAINING_MAX, FORCE_DELIVERY_LATE_REMAINING,
-    RUSH_TASK_DETOUR_BONUS,
+    RUSH_TASK_DETOUR_BONUS, DELIVERY_CRITICAL_SLACK_MULT,
     WATER_ROUTE_TASK_MIN,
     TASK_DETOUR_SLACK_RESERVE, WATER_ROUTE_NAV_PENALTY, INTEL_MAX_DISTANCE,
 )
@@ -102,6 +103,79 @@ def _force_delivery_buffer(map_gameplay: MapGameplayContext | None) -> float:
     if prof.force_delivery_slack_buffer > 0:
         return prof.force_delivery_slack_buffer
     return FORCE_DELIVERY_ETA_BUFFER
+
+
+def _gate_verify_frames(process_nodes: dict[str, dict] | None, gate_node_id: str) -> int:
+    if process_nodes and gate_node_id:
+        info = process_nodes.get(gate_node_id, {})
+        pt = info.get("processType", "")
+        if is_verify_process(pt):
+            return int(info.get("processRound") or PROCESS_COST_FRAMES.get("VERIFY", 6) or 6)
+    return int(PROCESS_COST_FRAMES.get("VERIFY", 6) or 6)
+
+
+def _is_delivery_critical(
+    round_num: int,
+    player: dict,
+    delivery_slack: float,
+    force_buffer: float,
+    gate_node_id: str,
+    current_node_id: str | None,
+) -> bool:
+    """Delivery-first mode: skip tasks/combat/rush_speed until verified."""
+    if is_verified(player) or is_delivered(player):
+        return False
+    if round_num < EARLY_GAME_MAX_ROUND:
+        return False
+    if round_num >= GATE_ENTRY_DEADLINE_ROUND:
+        return True
+    if (
+        gate_node_id
+        and current_node_id
+        and round_num >= GATE_ARRIVAL_TARGET_ROUND
+        and not is_at_node(player, gate_node_id)
+    ):
+        return True
+    return delivery_slack <= force_buffer * DELIVERY_CRITICAL_SLACK_MULT
+
+
+def _make_verify_gate_with_tactic(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    current_node_id: str,
+    gate_node_id: str,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    process_nodes: dict[str, dict] | None,
+    verify_gate_plain_only: bool = False,
+) -> dict:
+    """Build VERIFY_GATE; attach BREAK_ORDER only when quota remains and enemy guard blocks."""
+    action = make_verify_gate_action(current_node_id)
+    if verify_gate_plain_only:
+        return make_action(match_id, round_num, player_id, [action])
+
+    rush_used = int(player.get("rushTacticUsedCount", 0) or 0)
+    remaining = max(0, MAX_ROUND - round_num)
+    verify_frames = _gate_verify_frames(process_nodes, gate_node_id)
+
+    use_break = False
+    for node in inquire_nodes:
+        if node.get("nodeId") == gate_node_id:
+            guard = node.get("guard")
+            if is_enemy_guard(guard, my_team_id, player_id):
+                use_break = True
+            break
+
+    if (
+        use_break
+        and rush_used == 0
+        and remaining >= verify_frames + 2
+        and (get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1)
+    ):
+        action["rushTactic"] = "BREAK_ORDER"
+    return make_action(match_id, round_num, player_id, [action])
 
 
 def _has_move_speed_buff(player: dict) -> bool:
@@ -275,6 +349,7 @@ def decide_action(
     own_guard_sites: set[str] | None = None,
     map_gameplay: MapGameplayContext | None = None,
     task_claimed_this_stop: bool = False,
+    verify_gate_plain_only: bool = False,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -321,18 +396,25 @@ def decide_action(
             forced_pass_failed_targets, squad_clear_pending,
             guard_stuck_rounds, guard_stuck_target, own_guard_sites,
             map_gameplay, task_claimed_this_stop,
+            verify_gate_plain_only,
         )
         current_node_id = get_current_node_id(player) or ""
+        force_buffer = _force_delivery_buffer(map_gameplay)
+        delivery_slack = _delivery_slack_frames(
+            round_num, player, graph, current_node_id,
+            gate_node_id, terminal_node_ids, weather,
+            process_nodes, processed_node_ids,
+            map_gameplay=map_gameplay,
+        )
         append_force_delivery = _should_force_delivery(
             round_num, phase, player, graph, current_node_id,
             gate_node_id, terminal_node_ids, weather,
             process_nodes, processed_node_ids,
             map_gameplay=map_gameplay,
         )
-        if (
-            round_num >= GATE_ENTRY_DEADLINE_ROUND
-            and current_node_id
-            and current_node_id not in GATE_CORRIDOR_NODES
+        if _is_delivery_critical(
+            round_num, player, delivery_slack, force_buffer,
+            gate_node_id, current_node_id,
         ):
             append_force_delivery = True
         opp_player = None
@@ -400,6 +482,7 @@ def _decide_action_impl(
     own_guard_sites: set[str] | None = None,
     map_gameplay: MapGameplayContext | None = None,
     task_claimed_this_stop: bool = False,
+    verify_gate_plain_only: bool = False,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -457,11 +540,11 @@ def _decide_action_impl(
         route_blocked=route_blocked,
         map_gameplay=map_gameplay,
     )
-    if (
-        round_num >= GATE_ENTRY_DEADLINE_ROUND
-        and current_node_id
-        and current_node_id not in GATE_CORRIDOR_NODES
-    ):
+    delivery_critical = _is_delivery_critical(
+        round_num, player, delivery_slack, force_buffer,
+        gate_node_id, current_node_id,
+    )
+    if delivery_critical:
         force_delivery = True
     guard_wait_kwargs = {
         "force_delivery": force_delivery,
@@ -652,9 +735,11 @@ def _decide_action_impl(
     if current_node_id is None:
         return make_empty_action(match_id, round_num, player_id)
 
-    ice_claim = _try_claim_ice_box(
-        match_id, round_num, player_id, player, current_node,
-    )
+    ice_claim = None
+    if not delivery_critical:
+        ice_claim = _try_claim_ice_box(
+            match_id, round_num, player_id, player, current_node,
+        )
     if ice_claim is not None:
         return ice_claim
 
@@ -716,20 +801,11 @@ def _decide_action_impl(
     # At S14 (gate): VERIFY_GATE in RUSH phase
     if gate_node_id and is_at_node(player, gate_node_id) and not is_verified(player):
         if phase == "RUSH":
-            action = make_verify_gate_action(current_node_id)
-            use_break = False
-            for node in inquire_nodes:
-                if node.get("nodeId") == gate_node_id:
-                    guard = node.get("guard")
-                    if is_enemy_guard(guard, my_team_id, player_id):
-                        use_break = True
-                    break
-            if not use_break and delivery_slack <= force_buffer + 15:
-                if get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1:
-                    use_break = True
-            if use_break and (get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1):
-                action["rushTactic"] = "BREAK_ORDER"
-            return make_action(match_id, round_num, player_id, [action])
+            return _make_verify_gate_with_tactic(
+                match_id, round_num, player_id, player, current_node_id,
+                gate_node_id, inquire_nodes, my_team_id, process_nodes,
+                verify_gate_plain_only=verify_gate_plain_only,
+            )
         # Not RUSH yet: don't submit VERIFY_GATE (will be rejected)
         # Continue doing other things until RUSH
 
@@ -806,7 +882,7 @@ def _decide_action_impl(
     # (moved below task handling)
 
     # --- Gate corridor monitor: weaken / reroute before chasing tasks ---
-    if can_act(player):
+    if can_act(player) and not force_delivery:
         gate_action = _try_gate_corridor_guard_strategy(
             match_id, round_num, player_id, player, graph,
             current_node_id, gate_node_id, terminal_node_ids, weather,
@@ -817,7 +893,7 @@ def _decide_action_impl(
             return gate_action
 
     # --- P2/P3: Task strategy — 交付余量内尽可能多做顺路/小绕路任务 ---
-    if not force_delivery:
+    if not force_delivery and not delivery_critical:
         task_action = _handle_tasks(
             match_id, round_num, player_id, player, graph,
             current_node_id, tasks, player_id, phase, weather, blocked,
@@ -904,7 +980,7 @@ def _decide_action_impl(
         if combat_action is not None:
             return combat_action
 
-    # --- Rush tactics (策略文档 §10) ---
+    # --- Rush tactics (策略文档 §10) — reserve quota for gate verify ---
     rush_action = _handle_rush_tactics(
         match_id, round_num, player_id, player,
         current_node_id, phase, mode,
@@ -914,11 +990,22 @@ def _decide_action_impl(
         processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
         rush_speed_failed=rush_speed_failed,
         map_gameplay=map_gameplay,
+        force_delivery=force_delivery,
+        delivery_critical=delivery_critical,
     )
     if rush_action is not None:
         return rush_action
 
     # --- NAVIGATION: Move toward goal ---
+    if round_num <= EARLY_GAME_MAX_ROUND:
+        early_move = _try_early_start_move(
+            match_id, round_num, player_id, graph,
+            current_node_id, gate_node_id, obstacle_nodes,
+            visited_node_ids, map_gameplay,
+        )
+        if early_move is not None:
+            return early_move
+
     if force_delivery:
         move_action = _plan_force_delivery_move(
             match_id, round_num, player_id, player, graph,
@@ -930,15 +1017,6 @@ def _decide_action_impl(
         )
         if move_action is not None:
             return move_action
-
-    if not force_delivery:
-        early_move = _try_early_start_move(
-            match_id, round_num, player_id, graph,
-            current_node_id, gate_node_id, obstacle_nodes,
-            visited_node_ids, map_gameplay,
-        )
-        if early_move is not None:
-            return early_move
 
     move_target = _find_move_target(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
@@ -1433,6 +1511,8 @@ def _max_task_detour_budget(delivery_slack: float, phase: str = "", round_num: i
     """How many detour frames we can spend on off-path tasks while still delivering."""
     if round_num >= GATE_ENTRY_DEADLINE_ROUND:
         return 0
+    if round_num >= LATE_GAME_NO_MID_TASK_ROUND:
+        return 0
     if delivery_slack <= 0:
         return 0
     if delivery_slack > 120:
@@ -1443,8 +1523,6 @@ def _max_task_detour_budget(delivery_slack: float, phase: str = "", round_num: i
         budget = max(6, int(delivery_slack * 0.30))
     if phase == "RUSH":
         budget += RUSH_TASK_DETOUR_BONUS
-    if round_num >= LATE_GAME_NO_MID_TASK_ROUND:
-        budget = min(budget, 10)
     return min(MAX_TASK_DETOUR_CEILING, budget)
 
 
@@ -1464,6 +1542,10 @@ def _should_force_delivery(
     map_gameplay: MapGameplayContext | None = None,
 ) -> bool:
     """Pure delivery rush when ETA slack falls below the map-specific buffer."""
+    if is_verified(player) or is_delivered(player):
+        return False
+    if round_num < EARLY_GAME_MAX_ROUND and phase != "RUSH":
+        return False
     remaining = max(0, max_round - round_num)
     if remaining <= 0:
         return True
@@ -1701,10 +1783,13 @@ def _plan_force_delivery_move(
     log_prefix: str = "FORCE_DELIVERY",
 ) -> dict | None:
     """Resolve the next force-delivery hop, including detour and guard handling."""
+    path_avoid = set(avoid_route_nodes)
+    if current_node_id not in GATE_CORRIDOR_NODES:
+        path_avoid |= obstacle_nodes
     direct_target = _find_direct_delivery_step(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
-        avoid_nodes=avoid_route_nodes,
+        avoid_nodes=path_avoid,
     )
     target = direct_target
     detour = False
@@ -4530,7 +4615,8 @@ def _handle_combat(
                         bad = min(get_bad_fruit(player), 2)
                         if good + bad > 0:
                             action = make_break_guard_action(next_hop, good_fruit=good, bad_fruit=bad)
-                            if phase == "RUSH" and (bad >= 2 or good >= 1):
+                            rush_used = int(player.get("rushTacticUsedCount", 0) or 0)
+                            if phase == "RUSH" and rush_used == 0 and (bad >= 2 or good >= 1):
                                 action["rushTactic"] = "BREAK_ORDER"
                                 logger.info("Round %d: Breaking guard at %s with BREAK_ORDER", round_num, next_hop)
                             else:
@@ -4665,13 +4751,19 @@ def _handle_rush_tactics(
     visited_node_ids: set[str] | None = None,
     rush_speed_failed: bool = False,
     map_gameplay: MapGameplayContext | None = None,
+    force_delivery: bool = False,
+    delivery_critical: bool = False,
 ) -> dict | None:
     """Handle rush tactics: RUSH_SPEED, RUSH_PROTECT (策略文档 §10).
 
     Only available after RUSH phase. Each can be used once per match.
     RUSH_SPEED与马互斥: 有马buff时不使用.
+    Reserve rush quota for gate VERIFY / BREAK_ORDER during delivery push.
     """
     if phase != "RUSH":
+        return None
+
+    if force_delivery or delivery_critical:
         return None
 
     if int(player.get("rushTacticUsedCount", 0) or 0) >= 1:
@@ -4680,6 +4772,11 @@ def _handle_rush_tactics(
     state = player.get("state", "")
     if state != "IDLE":
         return None
+
+    if graph and gate_node_id and current_node_id:
+        hops = graph.path_length(current_node_id, gate_node_id, weather, obstacle_nodes)
+        if hops != float("inf") and hops <= 3:
+            return None
 
     freshness = get_freshness(player)
 
