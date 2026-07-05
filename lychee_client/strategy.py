@@ -21,7 +21,7 @@ from lychee_client.state import (
     can_move, can_act, get_current_node_id, get_next_node_id, needs_processing,
     is_delivered, is_retired, is_verified, is_at_node, is_in_passive_state,
     is_in_limited_state, is_on_route_edge, is_reverse_move_blocked,
-    is_at_or_approaching_gate,
+    is_at_or_approaching_gate, is_approaching_gate_on_edge,
     find_available_resources, find_task_at_node, get_enemy_busy_task_ids,
     get_good_fruit, get_bad_fruit, get_freshness,
     get_player_resources, has_resource, get_squad_count,
@@ -126,8 +126,8 @@ def _must_wait_for_gate_verify(
     last_move_failed: bool = False,
     last_move_error: str = "",
 ) -> bool:
-    """True when at/approaching the gate and verification is still pending."""
-    if not is_at_or_approaching_gate(player, gate_node_id):
+    """True when docked at the gate node and verification is still pending."""
+    if not gate_node_id or not is_at_node(player, gate_node_id):
         return False
     if last_move_failed and last_move_error == "VERIFY_REQUIRED":
         return True
@@ -235,6 +235,8 @@ def _skip_corridor_process_for_gate_verify(
 ) -> bool:
     """Skip optional corridor PROCESS while recovering for gate verify."""
     if not process_type or is_verify_process(process_type):
+        return False
+    if process_type in ("PALACE_TRANSFER", "PASS_TRANSFER"):
         return False
     if is_verified(player) or not gate_node_id or not current_node_id:
         return False
@@ -423,14 +425,23 @@ def _try_recover_gate_waiting(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
 ) -> dict | None:
-    """VERIFY_GATE needs IDLE; while on edge toward gate only WAIT (no reverse MOVE)."""
-    if not is_at_or_approaching_gate(player, gate_node_id):
+    """Resume MOVE on edge toward gate; WAIT only when docked at gate awaiting IDLE."""
+    if not gate_node_id:
         return None
-    logger.info(
-        "Round %d: approaching unverified gate %s, WAIT until IDLE for verify",
-        round_num, gate_node_id,
-    )
-    return make_action(match_id, round_num, player_id, [make_wait_action()])
+    next_node = get_next_node_id(player)
+    if is_approaching_gate_on_edge(player, gate_node_id) and next_node:
+        logger.info(
+            "Round %d: resume MOVE toward unverified gate %s (step=%s)",
+            round_num, gate_node_id, next_node,
+        )
+        return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
+    if is_at_node(player, gate_node_id):
+        logger.info(
+            "Round %d: at unverified gate %s, WAIT until IDLE for verify",
+            round_num, gate_node_id,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
+    return None
 
 
 def _decide_gate_verify_action(
@@ -1247,14 +1258,23 @@ def _decide_action_impl(
                     )
 
         if state == "MOVING":
+            if (
+                is_approaching_gate_on_edge(player, gate_node_id)
+                and not is_verified(player)
+            ):
+                logger.info(
+                    "Round %d: MOVING toward unverified gate %s, EMPTY heartbeat",
+                    round_num, gate_node_id,
+                )
+                return make_empty_action(match_id, round_num, player_id)
             if _must_wait_for_gate_verify(
                 player, gate_node_id, current_node_id, last_move_failed, last_move_error,
             ):
                 logger.info(
-                    "Round %d: MOVING toward unverified gate %s, WAIT until IDLE verify",
+                    "Round %d: MOVING at unverified gate %s, EMPTY until IDLE verify",
                     round_num, gate_node_id,
                 )
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
+                return make_empty_action(match_id, round_num, player_id)
             if guard_target or (
                 last_move_failed
                 and last_move_error in ("MOVE_BLOCKED_BY_GUARD", "MOVING_ACTION_FORBIDDEN")
@@ -2451,11 +2471,21 @@ def _plan_limited_state_force_delivery_move(
         return retreat
     if _must_wait_for_gate_verify(player, gate_node_id, current_node_id):
         logger.info(
-            "Round %d: limited force delivery blocked at unverified gate %s, WAIT",
+            "Round %d: limited force delivery at unverified gate %s, WAIT until IDLE",
             round_num, current_node_id,
         )
         return make_action(match_id, round_num, player_id, [make_wait_action()])
     next_node = player.get("nextNodeId", "")
+    if (
+        is_approaching_gate_on_edge(player, gate_node_id)
+        and next_node
+        and not is_verified(player)
+    ):
+        logger.info(
+            "Round %d: limited force delivery resume MOVE toward gate %s (step=%s)",
+            round_num, gate_node_id, next_node,
+        )
+        return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
     if next_node:
         if next_node in route_blocked:
             logger.info(

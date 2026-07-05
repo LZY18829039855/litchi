@@ -232,6 +232,16 @@ def is_at_or_approaching_gate(player: dict, gate_node_id: str) -> bool:
     return False
 
 
+def is_approaching_gate_on_edge(player: dict, gate_node_id: str) -> bool:
+    """在路线边上移向宫门，且尚未抵达宫门节点。"""
+    if not gate_node_id:
+        return False
+    current = get_current_node_id(player)
+    if current == gate_node_id:
+        return False
+    return is_on_route_edge(player) and get_next_node_id(player) == gate_node_id
+
+
 def is_delivered(player: dict) -> bool:
     return player.get("delivered", False)
 
