@@ -1599,6 +1599,12 @@ def _should_force_delivery(
         route_blocked=route_blocked,
         map_gameplay=map_gameplay,
     )
+    if (
+        phase == "RUSH"
+        and remaining > FORCE_DELIVERY_MIN_REMAINING
+        and get_task_score(player) < TASK_SCORE_TARGET
+    ):
+        return slack <= _force_delivery_buffer(map_gameplay) * 0.5
     return slack <= _force_delivery_buffer(map_gameplay)
 
 
@@ -3345,6 +3351,28 @@ def _handle_tasks(
                 and task.get("active", False)
                 and not task.get("completed", False)
                 and not task.get("failed", False)):
+            task_id = task.get("taskId", "")
+            task_node = task.get("nodeId", "")
+            template_id = get_task_template_id(task)
+            neighbors = graph.get_neighbors(current_node_id) if graph else []
+            can_retry_here = (
+                task_node == current_node_id
+                or (template_id.startswith("T04") and task_node in neighbors)
+            )
+            if (
+                task_id
+                and not task_claimed_this_stop
+                and task_id not in failed_task_ids
+                and task_id not in enemy_busy_task_ids
+                and can_retry_here
+            ):
+                logger.info(
+                    "Round %d: Retrying owned active task %s (template=%s) at %s",
+                    round_num, task_id, template_id, current_node_id,
+                )
+                return make_action(match_id, round_num, player_id, [
+                    make_claim_task_action(task_id)
+                ])
             return None
 
     # Try to claim task at current node (prioritized by score/round)

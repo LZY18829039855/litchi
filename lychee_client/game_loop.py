@@ -13,7 +13,7 @@ from lychee_client.map_graph import MapGraph
 from lychee_client.map_gameplay import MapGameplayContext, build_map_gameplay, default_map_gameplay
 from lychee_client.state import (
     can_move, get_current_node_id, needs_processing, GUARD_STUCK_AVOID_ROUNDS,
-    get_enemy_busy_task_ids, GATE_CORRIDOR_NODES, is_enemy_guard,
+    get_enemy_busy_task_ids, GATE_CORRIDOR_NODES, is_enemy_guard, get_task_score,
 )
 from lychee_client.decision import make_registration, make_ready, make_action, make_empty_action
 from lychee_client.strategy import decide_action
@@ -49,6 +49,8 @@ class GameClient:
         self.verify_gate_plain_only = False  # after RUSH_TACTIC_INVALID_BINDING, omit rushTactic on VERIFY_GATE
         self.last_claimed_task_id = ""  # track last CLAIM_TASK taskId for failed_task_ids
         self.last_claimed_task_node_id = ""
+        self.last_claimed_task_round = 0
+        self.last_claimed_task_score_before = 0
         self.pending_task_hold_task_id = ""
         self.pending_task_hold_node_id = ""
         self.pending_task_hold_until_round = 0
@@ -199,6 +201,57 @@ class GameClient:
             if not still_active:
                 self.active_contest_id = ""
 
+    def _sync_task_claim_confirmation(
+        self,
+        inquire: InquireMessage,
+        player: dict[str, Any],
+        current_node_id: str | None,
+    ) -> None:
+        """Allow a CLAIM_TASK retry when no success signal arrives after a few frames."""
+        if (
+            not self.task_claimed_this_stop
+            or not self.last_claimed_task_id
+            or not current_node_id
+            or self.last_claimed_task_node_id != current_node_id
+        ):
+            return
+
+        current_score = get_task_score(player)
+        if current_score > self.last_claimed_task_score_before:
+            logger.info(
+                "Round %d: Task %s confirmed by score %d->%d",
+                inquire.round,
+                self.last_claimed_task_id,
+                self.last_claimed_task_score_before,
+                current_score,
+            )
+            return
+
+        if isinstance(player.get("currentProcess"), dict):
+            return
+        if inquire.round <= self.last_claimed_task_round + 2:
+            return
+
+        task_alive_here = False
+        for task in inquire.tasks:
+            if task.get("taskId", "") != self.last_claimed_task_id:
+                continue
+            if task.get("completed", False) or task.get("failed", False):
+                break
+            owner = task.get("ownerPlayerId", 0)
+            protection = task.get("protectionPlayerId", 0)
+            if owner in (0, self.player_id) and protection in (0, self.player_id):
+                task_alive_here = True
+            break
+        if task_alive_here:
+            logger.info(
+                "Round %d: Task %s not confirmed at %s, allowing CLAIM_TASK retry",
+                inquire.round,
+                self.last_claimed_task_id,
+                current_node_id,
+            )
+            self.task_claimed_this_stop = False
+
     def handle_inquire(self, inquire: InquireMessage) -> dict | None:
         """Handle inquire message: decide and send action.
 
@@ -243,6 +296,8 @@ class GameClient:
             self.task_claimed_this_stop = False
             self.last_node_id = current_node_id
             self.visited_node_ids.add(current_node_id)
+
+        self._sync_task_claim_confirmation(inquire, player, current_node_id)
 
         # Update graph if edges are provided
         if inquire.edges:
@@ -367,6 +422,7 @@ class GameClient:
                             self.pending_task_hold_task_id = ""
                             self.pending_task_hold_node_id = ""
                             self.pending_task_hold_until_round = 0
+                            self.task_claimed_this_stop = False
                             logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
                     if ar.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
                         failed_tid = self.last_claimed_task_id
@@ -457,6 +513,7 @@ class GameClient:
                         self.pending_task_hold_task_id = ""
                         self.pending_task_hold_node_id = ""
                         self.pending_task_hold_until_round = 0
+                        self.task_claimed_this_stop = False
                         logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
                 if payload.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
                     failed_tid = self.last_claimed_task_id
@@ -638,6 +695,8 @@ class GameClient:
             action_detail = f"({actions[0].get('taskId', '?')})"
             self.last_claimed_task_id = actions[0].get("taskId", "")
             self.last_claimed_task_node_id = current_node_id or ""
+            self.last_claimed_task_round = inquire.round
+            self.last_claimed_task_score_before = get_task_score(player)
             self.task_claimed_this_stop = True
         self.last_forced_pass_target = actions[0].get("targetNodeId", "") if action_type == "FORCED_PASS" else ""
         for action_item in actions:
