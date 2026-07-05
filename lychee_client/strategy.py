@@ -634,19 +634,20 @@ def _decide_action_impl(
                         round_num, current_node_id,
                     )
                     return make_action(match_id, round_num, player_id, [make_wait_action()])
-                # VERIFY_GATE is IDLE-only (任务书 §8.2); WAITING must hold until IDLE.
+                # VERIFY_GATE is IDLE-only (任务书 §8.2); use EMPTY heartbeat so
+                # WAITING can transition back to IDLE (WAIT would keep WAITING forever).
                 if phase == "RUSH":
                     logger.info(
                         "Round %d: WAITING at unverified gate %s in RUSH, "
-                        "WAIT for IDLE verify (last=%s)",
+                        "EMPTY for IDLE verify (last=%s)",
                         round_num, current_node_id, last_move_error or "pending",
                     )
                 else:
                     logger.info(
-                        "Round %d: WAITING at unverified gate %s until RUSH",
+                        "Round %d: WAITING at unverified gate %s until RUSH, EMPTY heartbeat",
                         round_num, current_node_id,
                     )
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
+                return make_empty_action(match_id, round_num, player_id)
 
             pending_process_type = _get_pending_station_process_type(
                 current_node_id, next_node, process_nodes, processed_node_ids,
@@ -881,10 +882,10 @@ def _decide_action_impl(
                 verify_gate_plain_only=verify_gate_plain_only,
             )
         logger.info(
-            "Round %d: at unverified gate %s before RUSH, waiting",
+            "Round %d: at unverified gate %s before RUSH, EMPTY heartbeat",
             round_num, current_node_id,
         )
-        return make_action(match_id, round_num, player_id, [make_wait_action()])
+        return make_empty_action(match_id, round_num, player_id)
 
     # --- Fixed processing (策略文档 §4.1: 再次到达同一站需重新处理) ---
     # Process at current node ONLY if not already processed this visit.
