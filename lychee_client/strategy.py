@@ -151,7 +151,7 @@ def _make_verify_gate_with_tactic(
     process_nodes: dict[str, dict] | None,
     verify_gate_plain_only: bool = False,
 ) -> dict:
-    """Build VERIFY_GATE; attach BREAK_ORDER only when quota remains and enemy guard blocks."""
+    """Build VERIFY_GATE; attach BREAK_ORDER for contested or time-sensitive verification."""
     action = make_verify_gate_action(current_node_id)
     if verify_gate_plain_only:
         return make_action(match_id, round_num, player_id, [action])
@@ -167,15 +167,26 @@ def _make_verify_gate_with_tactic(
             if is_enemy_guard(guard, my_team_id, player_id):
                 use_break = True
             break
+    # BREAK_ORDER also legally shortens gate verification by 3 frames; use it when
+    # delivery timing is tight even if the gate itself is not guarded.
+    use_break = use_break or remaining <= verify_frames + 12
 
     if (
         use_break
         and rush_used == 0
         and remaining >= verify_frames + 2
-        and (get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1)
+        and (get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 2)
     ):
         action["rushTactic"] = "BREAK_ORDER"
     return make_action(match_id, round_num, player_id, [action])
+
+
+def _break_guard_investment(player: dict, reserve_good_fruit: int = 1) -> tuple[int, int]:
+    """Choose BREAK_GUARD fruit while preserving at least one good fruit for delivery."""
+    bad = min(get_bad_fruit(player), 2)
+    spendable_good = max(0, get_good_fruit(player) - reserve_good_fruit)
+    good = min(spendable_good, 2)
+    return good, bad
 
 
 def _has_move_speed_buff(player: dict) -> bool:
@@ -560,6 +571,16 @@ def _decide_action_impl(
         "process_nodes": process_nodes,
         "processed_node_ids": processed_node_ids,
     }
+
+    if state != "CONTESTING" and _find_contest_id(player_id, contests, None, ""):
+        on_water_route = _is_on_water_route(graph, current_node_id, gate_node_id, terminal_node_ids)
+        return _handle_contesting(
+            match_id, round_num, player_id, player,
+            contests, events, active_contest_id, player,
+            all_players, phase, on_water_route,
+            graph=graph, gate_node_id=gate_node_id,
+            terminal_node_ids=terminal_node_ids, obstacle_nodes=obstacle_nodes,
+        )
 
     if state != "CONTESTING" and not is_in_passive_state(player):
         if not _should_defer_ice_box(player, last_move_error, route_blocked, guard_blocked_targets, avoid_route_nodes):
@@ -1254,10 +1275,10 @@ def _gate_corridor_path_blocked(
     if not current_node_id or not gate_node_id or not guard_nodes:
         return False
     blocked = set(guard_nodes) | set(avoid_route_nodes)
-    direct = graph.shortest_path(current_node_id, gate_node_id, weather, blocked, process_nodes)
+    direct = graph.shortest_path(current_node_id, gate_node_id, weather, blocked)
     if direct:
         return False
-    return bool(graph.shortest_path(current_node_id, gate_node_id, weather, avoid_route_nodes, process_nodes))
+    return bool(graph.shortest_path(current_node_id, gate_node_id, weather, avoid_route_nodes))
 
 
 def _try_gate_corridor_guard_strategy(
@@ -1878,8 +1899,7 @@ def _handle_force_delivery_blocker(
 
     guard = _get_node_guard(inquire_nodes, target_node_id)
     if is_enemy_guard(guard, my_team_id, player_id):
-        good = min(get_good_fruit(player), 2)
-        bad = min(get_bad_fruit(player), 2)
+        good, bad = _break_guard_investment(player)
         if good + bad > 0:
             action = make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
             logger.info("Round %d: FORCE_DELIVERY break guard at %s", round_num, target_node_id)
@@ -1890,10 +1910,10 @@ def _handle_force_delivery_blocker(
     if target_node_id in obstacle_nodes:
         if not _confirmed_obstacle(inquire_nodes, target_node_id, obstacle_nodes):
             logger.info(
-                "Round %d: FORCE_DELIVERY skip CLEAR at %s (no confirmed obstacle)",
+                "Round %d: FORCE_DELIVERY no confirmed blocker at %s, skip FORCED_PASS",
                 round_num, target_node_id,
             )
-            return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+            return make_empty_action(match_id, round_num, player_id)
         if guard_is_active(guard) and not is_own_guard(guard, my_team_id, player_id):
             logger.info(
                 "Round %d: FORCE_DELIVERY skip CLEAR at %s (active guard, not obstacle)",
@@ -1921,8 +1941,8 @@ def _handle_force_delivery_blocker(
         logger.info("Round %d: FORCE_DELIVERY forced pass obstacle at %s", round_num, target_node_id)
         return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
-    logger.info("Round %d: FORCE_DELIVERY forced pass blocked %s", round_num, target_node_id)
-    return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+    logger.info("Round %d: FORCE_DELIVERY no live blocker at %s, skip FORCED_PASS", round_num, target_node_id)
+    return make_empty_action(match_id, round_num, player_id)
 
 
 def _resolve_guarded_delivery_hop(
@@ -1961,11 +1981,16 @@ def _resolve_guarded_delivery_hop(
             )
 
     guard = _get_node_guard(inquire_nodes, target_node_id)
-    guarded = (
-        target_node_id in route_blocked
-        or is_enemy_guard(guard, my_team_id, player_id)
-    )
+    live_guard = is_enemy_guard(guard, my_team_id, player_id)
+    live_obstacle = _confirmed_obstacle(inquire_nodes, target_node_id, obstacle_nodes)
+    guarded = target_node_id in route_blocked or live_guard or live_obstacle
     if not guarded:
+        return None
+    if not live_guard and not live_obstacle:
+        logger.info(
+            "Round %d: %s is locally blocked only, skip FORCED_PASS probe",
+            round_num, target_node_id,
+        )
         return None
 
     if target_node_id in forced_pass_failed_targets:
@@ -2006,6 +2031,8 @@ def _use_horse_before_expensive_hop(
 ) -> dict | None:
     """Use horse buff before a high-cost edge."""
     if not target_node_id or current_node_id == target_node_id:
+        return None
+    if _has_move_speed_buff(player):
         return None
     hop_cost = graph.edge_cost(
         current_node_id, target_node_id, weather, None, process_nodes,
@@ -2968,8 +2995,7 @@ def _make_squad_weaken_action(
             if guard.get("defense", 0) > 0:
                 return make_squad_weaken_action(target_node_id)
             return None
-    # inquire 可能未包含远程节点，仍尝试削弱
-    return make_squad_weaken_action(target_node_id)
+    return None
 
 
 def _wait_and_weaken_guard(
@@ -3059,6 +3085,8 @@ def _handle_moving(
     player: dict, graph: MapGraph, weather: dict | None, phase: str,
 ) -> dict:
     """Handle MOVING state: can use horse or rush_speed."""
+    if _has_move_speed_buff(player):
+        return make_empty_action(match_id, round_num, player_id)
     # Use FAST_HORSE if available and on a long road segment
     if has_resource(player, "FAST_HORSE"):
         return make_action(match_id, round_num, player_id, [
@@ -3115,8 +3143,7 @@ def _handle_blocked_by_guard(
                 continue
             guard = node.get("guard", {})
             if is_enemy_guard(guard, get_team_id(player), player_id):
-                good = min(get_good_fruit(player), 2)
-                bad = min(get_bad_fruit(player), 2)
+                good, bad = _break_guard_investment(player)
                 if good + bad > 0:
                     logger.info(
                         "Round %d: BREAK_GUARD at %s (gf=%d bf=%d)",
@@ -4484,7 +4511,15 @@ def _should_set_guard_dynamic(
 
     task_score = get_task_score(player)
     guard_min = _profile(map_gameplay).guard_min_task_score
-    if task_score < guard_min and mode != "GATE_FIGHT":
+    final_guard_site = _is_final_corridor_guard_site(
+        graph, current_node_id, gate_node_id, inquire_nodes, process_nodes,
+        weather, obstacle_nodes,
+    )
+    final_guard_exception = (
+        final_guard_site
+        and task_score >= FINAL_CORRIDOR_GUARD_TASK_MIN
+    )
+    if task_score < guard_min and mode != "GATE_FIGHT" and not final_guard_exception:
         return False, f"task<{guard_min}"
     hops_to_gate = float("inf")
     if graph and gate_node_id:
@@ -4507,10 +4542,7 @@ def _should_set_guard_dynamic(
             player, inquire_nodes, current_node_id, task_score,
         ):
             return False, "low-fruit"
-        if _is_final_corridor_guard_site(
-            graph, current_node_id, gate_node_id, inquire_nodes, process_nodes,
-            weather, obstacle_nodes,
-        ):
+        if final_guard_site:
             return True, "gate-fight-final-choke"
         if _is_key_choke_node(graph, current_node_id):
             return True, "gate-fight-choke"
@@ -4661,12 +4693,11 @@ def _handle_combat(
                         continue
                     guard = node.get("guard", {})
                     if is_enemy_guard(guard, my_team_id, player_id):
-                        good = min(get_good_fruit(player), 2)
-                        bad = min(get_bad_fruit(player), 2)
+                        good, bad = _break_guard_investment(player)
                         if good + bad > 0:
                             action = make_break_guard_action(next_hop, good_fruit=good, bad_fruit=bad)
                             rush_used = int(player.get("rushTacticUsedCount", 0) or 0)
-                            if phase == "RUSH" and rush_used == 0 and (bad >= 2 or good >= 1):
+                            if phase == "RUSH" and rush_used == 0 and (bad >= 2 or get_good_fruit(player) >= 2):
                                 action["rushTactic"] = "BREAK_ORDER"
                                 logger.info("Round %d: Breaking guard at %s with BREAK_ORDER", round_num, next_hop)
                             else:
@@ -4835,6 +4866,8 @@ def _handle_rush_tactics(
         return make_action(match_id, round_num, player_id, [make_rush_protect_action()])
 
     if rush_speed_failed or _has_move_speed_buff(player):
+        return None
+    if get_good_fruit(player) < 3:
         return None
 
     if graph and gate_node_id and current_node_id:

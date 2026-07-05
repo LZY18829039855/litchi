@@ -251,6 +251,26 @@ class GameClient:
             else:
                 self.graph = MapGraph(inquire.nodes, inquire.edges)
 
+        # Determine gate and terminal IDs early so guard avoidance never blacklists
+        # mandatory delivery nodes such as S14.
+        gate_node_id = ""
+        terminal_node_ids: list[str] = []
+        if self.start_msg:
+            gate_node_id = self.start_msg.gate_node_id
+            terminal_node_ids = self.start_msg.terminal_node_ids
+        if not gate_node_id:
+            for node in inquire.nodes:
+                if node.get("gateNodeId") or node.get("nodeType") == "GATE":
+                    gate_node_id = node.get("nodeId", "")
+                    break
+        if not terminal_node_ids:
+            for node in inquire.nodes:
+                if node.get("terminalNodeId") or node.get("nodeType") in ("TERMINAL", "FINISH") or node.get("terminal"):
+                    nid = node.get("nodeId", "")
+                    if nid:
+                        terminal_node_ids.append(nid)
+        critical_route_nodes = {gate_node_id, *terminal_node_ids} - {""}
+
         # Update process_nodes from inquire.nodes[] (runtime state may override)
         for node in inquire.nodes:
             nid = node.get("nodeId", "")
@@ -263,8 +283,12 @@ class GameClient:
             if nid and (nid in self.guard_blocked_targets or nid in self.avoid_route_nodes):
                 guard = node.get("guard", {}) or {}
                 if not is_enemy_guard(guard, player.get("teamId", ""), self.player_id):
-                    if nid in self.guard_blocked_targets:
+                    if nid in self.guard_blocked_targets or nid in self.avoid_route_nodes:
                         self.guard_blocked_targets.discard(nid)
+                        self.avoid_route_nodes.discard(nid)
+                        if self.guard_stuck_target == nid:
+                            self.guard_stuck_target = ""
+                            self.guard_stuck_rounds = 0
                         logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
                 elif current_node_id and self.graph and nid in self.graph.get_neighbors(current_node_id):
                     self.guard_blocked_targets.add(nid)
@@ -285,9 +309,13 @@ class GameClient:
                     )
                     self._gate_guard_seen.add(nid)
                 self.guard_blocked_targets.add(nid)
-            elif nid in self._gate_guard_seen and nid not in self.avoid_route_nodes:
+            elif nid in self._gate_guard_seen:
                 self.guard_blocked_targets.discard(nid)
+                self.avoid_route_nodes.discard(nid)
                 self._gate_guard_seen.discard(nid)
+                if self.guard_stuck_target == nid:
+                    self.guard_stuck_target = ""
+                    self.guard_stuck_rounds = 0
                 logger.info("Round %d: Gate monitor: guard cleared at %s", inquire.round, nid)
 
         if current_node_id and self.graph:
@@ -536,33 +564,23 @@ class GameClient:
                 self.guard_stuck_target = stuck_block
                 self.guard_stuck_rounds = 1
             if self.guard_stuck_rounds >= GUARD_STUCK_AVOID_ROUNDS:
-                if stuck_block not in self.avoid_route_nodes:
+                if stuck_block in critical_route_nodes:
+                    self.avoid_route_nodes.discard(stuck_block)
+                    if self.guard_stuck_rounds == GUARD_STUCK_AVOID_ROUNDS:
+                        logger.info(
+                            "Round %d: Keeping critical route node %s temporarily blocked after %d stuck rounds",
+                            inquire.round, stuck_block, self.guard_stuck_rounds,
+                        )
+                elif stuck_block not in self.avoid_route_nodes:
                     logger.info(
                         "Round %d: Permanently avoiding %s after %d stuck rounds",
                         inquire.round, stuck_block, self.guard_stuck_rounds,
                     )
-                self.avoid_route_nodes.add(stuck_block)
-                self.guard_blocked_targets.discard(stuck_block)
+                    self.avoid_route_nodes.add(stuck_block)
+                    self.guard_blocked_targets.discard(stuck_block)
         elif not stuck_block:
             self.guard_stuck_target = ""
             self.guard_stuck_rounds = 0
-
-        # Determine gate and terminal IDs (from start message or inquire nodes)
-        gate_node_id = ""
-        terminal_node_ids: list[str] = []
-        if self.start_msg:
-            gate_node_id = self.start_msg.gate_node_id
-            terminal_node_ids = self.start_msg.terminal_node_ids
-        # Fallback: scan inquire nodes for gate/terminal markers
-        if not gate_node_id:
-            for node in inquire.nodes:
-                if node.get("gateNodeId") or node.get("nodeType") == "GATE":
-                    gate_node_id = node.get("nodeId", "")
-                    break
-        if not terminal_node_ids:
-            for node in inquire.nodes:
-                if node.get("terminalNodeId") or node.get("nodeType") in ("TERMINAL", "FINISH") or node.get("terminal"):
-                    terminal_node_ids.append(node.get("nodeId", ""))
 
         # Decide action
         action_msg = decide_action(
