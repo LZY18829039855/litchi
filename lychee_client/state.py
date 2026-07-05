@@ -68,6 +68,7 @@ ICE_BOX_NEAR_GATE_HOPS = 8
 GATE_ENTRY_DEADLINE_ROUND = 380
 GATE_ARRIVAL_TARGET_ROUND = 520
 RUSH_MIN_ROUND = 390  # 任务书 §6.5：390 帧前不触发宫宴冲刺
+GATE_APPROACH_ROUND = RUSH_MIN_ROUND - 5  # 385 帧起才允许向宫门 S14 推进
 FORCE_DELIVERY_MIN_TASK_ROUND = 350  # 任务分未达标前不强制交付
 EARLY_GAME_MAX_ROUND = 120
 SQUAD_CLEAR_MIN_ROUND = 350
@@ -75,6 +76,8 @@ SQUAD_CLEAR_MIDMAP_MIN_ROUND = 120
 LATE_GAME_NO_MID_TASK_ROUND = 250
 DELIVERY_CRITICAL_SLACK_MULT = 2.0
 SCOUT_MARKER_VALID_FRAMES = 45
+CORRIDOR_SCOUT_MIN_SQUAD = 2
+CORRIDOR_SCOUT_MAX_TRAVEL = SCOUT_MARKER_VALID_FRAMES
 SQUAD_SCOUT_MIN_DELAY = 3
 SQUAD_SCOUT_MAX_DELAY = 15
 FINAL_CORRIDOR_GUARD_MIN_LEAD = 1
@@ -202,6 +205,31 @@ def get_current_node_id(player: dict) -> str | None:
 
 def get_next_node_id(player: dict) -> str | None:
     return player.get("nextNodeId")
+
+
+def is_on_route_edge(player: dict) -> bool:
+    """True when MOVING/WAITING on a route segment (not docked at a node)."""
+    return player.get("state", "") in _LIMITED_ACT_STATES
+
+
+def is_reverse_move_blocked(player: dict, target_node_id: str) -> bool:
+    """MOVING/WAITING 时不能 MOVE 回本段路线起点（任务书 §4.2 / §8.2）。"""
+    if not is_on_route_edge(player) or not target_node_id:
+        return False
+    segment_start = player.get("currentNodeId", "") or ""
+    return bool(segment_start and target_node_id == segment_start)
+
+
+def is_at_or_approaching_gate(player: dict, gate_node_id: str) -> bool:
+    """已停在宫门，或正在沿路线边驶向宫门。"""
+    if not gate_node_id:
+        return False
+    current = get_current_node_id(player)
+    if current == gate_node_id:
+        return True
+    if is_on_route_edge(player) and get_next_node_id(player) == gate_node_id:
+        return True
+    return False
 
 
 def is_delivered(player: dict) -> bool:

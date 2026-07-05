@@ -18,9 +18,10 @@ from typing import Any
 from lychee_client.map_graph import MapGraph, ROUTE_FRESHNESS_LOSS, PROCESS_COST_FRAMES
 from lychee_client.map_gameplay import MapGameplayContext, MapStrategyProfile, default_map_gameplay
 from lychee_client.state import (
-    can_move, can_act, get_current_node_id, needs_processing,
+    can_move, can_act, get_current_node_id, get_next_node_id, needs_processing,
     is_delivered, is_retired, is_verified, is_at_node, is_in_passive_state,
-    is_in_limited_state,
+    is_in_limited_state, is_on_route_edge, is_reverse_move_blocked,
+    is_at_or_approaching_gate,
     find_available_resources, find_task_at_node, get_enemy_busy_task_ids,
     get_good_fruit, get_bad_fruit, get_freshness,
     get_player_resources, has_resource, get_squad_count,
@@ -44,10 +45,11 @@ from lychee_client.state import (
     FINAL_CORRIDOR_GUARD_MIN_LEAD, FINAL_CORRIDOR_GUARD_TASK_MIN,
     GATE_DELAY_GUARD_MIN_OPP_HOPS, GATE_DELAY_GUARD_EXTRA_FRUIT,
     ICE_BOX_NEAR_GATE_HOPS,     GATE_ENTRY_DEADLINE_ROUND, GATE_ARRIVAL_TARGET_ROUND,
-    RUSH_MIN_ROUND, FORCE_DELIVERY_MIN_TASK_ROUND,
+    RUSH_MIN_ROUND, GATE_APPROACH_ROUND, FORCE_DELIVERY_MIN_TASK_ROUND,
     EARLY_GAME_MAX_ROUND,
     SQUAD_CLEAR_MIN_ROUND, SQUAD_CLEAR_MIDMAP_MIN_ROUND, LATE_GAME_NO_MID_TASK_ROUND,
     SCOUT_MARKER_VALID_FRAMES, SQUAD_SCOUT_MIN_DELAY, SQUAD_SCOUT_MAX_DELAY,
+    CORRIDOR_SCOUT_MIN_SQUAD, CORRIDOR_SCOUT_MAX_TRAVEL,
     FORCE_DELIVERY_ETA_BUFFER, FORCE_DELIVERY_MIN_REMAINING,
     FORCE_DELIVERY_ETA_REMAINING_MAX, FORCE_DELIVERY_LATE_REMAINING,
     RUSH_TASK_DETOUR_BONUS, DELIVERY_CRITICAL_SLACK_MULT,
@@ -124,8 +126,8 @@ def _must_wait_for_gate_verify(
     last_move_failed: bool = False,
     last_move_error: str = "",
 ) -> bool:
-    """True when still at the gate and server/client agree verification is pending."""
-    if not gate_node_id or not current_node_id or current_node_id != gate_node_id:
+    """True when at/approaching the gate and verification is still pending."""
+    if not is_at_or_approaching_gate(player, gate_node_id):
         return False
     if last_move_failed and last_move_error == "VERIFY_REQUIRED":
         return True
@@ -133,8 +135,47 @@ def _must_wait_for_gate_verify(
 
 
 def _should_hold_before_rush(round_num: int, phase: str) -> bool:
-    """RUSH opens at round 390 at earliest; do not enter S14 before then."""
-    return round_num < RUSH_MIN_ROUND and phase != "RUSH"
+    """Do not enter the gate until the final approach window (385+)."""
+    return round_num < GATE_APPROACH_ROUND
+
+
+def _pre_rush_navigation_goal(gate_node_id: str) -> str | None:
+    """Staging node before the gate — hold in corridor instead of camping at S14."""
+    if not gate_node_id:
+        return None
+    if gate_node_id in GATE_CORRIDOR_ORDER:
+        idx = GATE_CORRIDOR_ORDER.index(gate_node_id)
+        if idx > 0:
+            return GATE_CORRIDOR_ORDER[idx - 1]
+    return None
+
+
+def _resolve_navigation_goal(
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    graph: MapGraph,
+    current_node_id: str,
+    weather: dict | None = None,
+    blocked: set[str] | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    round_num: int = 0,
+    phase: str = "",
+) -> str | None:
+    """Navigation goal; before gate approach window, target corridor staging not S14."""
+    goal = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, blocked, process_nodes,
+    )
+    if (
+        goal == gate_node_id
+        and gate_node_id
+        and _should_hold_before_rush(round_num, phase)
+    ):
+        staging = _pre_rush_navigation_goal(gate_node_id)
+        if staging:
+            return staging
+    return goal
 
 
 def _pre_rush_gate_blocked(
@@ -151,6 +192,7 @@ def _try_step_back_from_pre_rush_gate(
     round_num: int,
     player_id: int,
     graph: MapGraph,
+    player: dict,
     current_node_id: str,
     gate_node_id: str,
     terminal_node_ids: list[str],
@@ -160,13 +202,15 @@ def _try_step_back_from_pre_rush_gate(
     avoid_nodes: set[str] | None = None,
     phase: str = "",
 ) -> dict | None:
-    """Leave S14 before RUSH to do corridor tasks instead of idling at the gate."""
+    """Leave S14 before approach window — only when docked IDLE, never reverse on edge."""
     if not _should_hold_before_rush(round_num, phase):
         return None
     if not gate_node_id or current_node_id != gate_node_id:
         return None
+    if is_on_route_edge(player):
+        return None
     step = _pick_gate_step_off_node(
-        graph, current_node_id, gate_node_id, terminal_node_ids, weather,
+        graph, player, current_node_id, gate_node_id, terminal_node_ids, weather,
         avoid_nodes=avoid_nodes,
         process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
@@ -327,6 +371,7 @@ def _try_break_enemy_guard_at_node(
 
 def _pick_gate_step_off_node(
     graph: MapGraph,
+    player: dict,
     current_node_id: str,
     gate_node_id: str,
     terminal_node_ids: list[str],
@@ -335,13 +380,15 @@ def _pick_gate_step_off_node(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
 ) -> str | None:
-    """Pick a non-terminal neighbor to leave the gate and regain IDLE."""
+    """Pick a legal neighbor to leave the gate; never target forbidden reverse hop."""
     terminal_set = set(terminal_node_ids or [])
     blocked = set(avoid_nodes or [])
     processed = processed_node_ids or set()
     candidates = []
     for nb in graph.get_neighbors(current_node_id):
         if nb in terminal_set or nb in blocked:
+            continue
+        if is_reverse_move_blocked(player, nb):
             continue
         if process_nodes and nb in process_nodes and nb not in processed:
             pt = process_nodes[nb].get("processType", "")
@@ -366,6 +413,7 @@ def _try_recover_gate_waiting(
     match_id: str,
     round_num: int,
     player_id: int,
+    player: dict,
     graph: MapGraph,
     current_node_id: str,
     gate_node_id: str,
@@ -375,12 +423,12 @@ def _try_recover_gate_waiting(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
 ) -> dict | None:
-    """VERIFY_GATE is IDLE-only; WAIT at the gate until movement settles."""
-    if not graph or not current_node_id or current_node_id != gate_node_id:
+    """VERIFY_GATE needs IDLE; while on edge toward gate only WAIT (no reverse MOVE)."""
+    if not is_at_or_approaching_gate(player, gate_node_id):
         return None
     logger.info(
-        "Round %d: WAITING at unverified gate %s, WAIT for IDLE verify",
-        round_num, current_node_id,
+        "Round %d: approaching unverified gate %s, WAIT until IDLE for verify",
+        round_num, gate_node_id,
     )
     return make_action(match_id, round_num, player_id, [make_wait_action()])
 
@@ -555,6 +603,197 @@ def _maybe_append_gate_corridor_squad_clear(
     return _append_squad_action(action_msg, make_squad_clear_action(clear_target))
 
 
+def _corridor_scout_target_order(
+    gate_node_id: str,
+    player: dict,
+) -> list[str]:
+    """Priority scout targets when entering the gate corridor (nearest important nodes first)."""
+    ordered: list[str] = []
+    if gate_node_id and not is_verified(player):
+        ordered.append(gate_node_id)
+    for nid in reversed(GATE_CORRIDOR_ORDER):
+        if nid == gate_node_id or nid not in GATE_CORRIDOR_NODES:
+            continue
+        if nid not in ordered:
+            ordered.append(nid)
+    return ordered
+
+
+def _scout_timing_viable(
+    graph: MapGraph,
+    current_node_id: str,
+    target_id: str,
+    travel: float,
+    weather: dict | None,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+) -> tuple[bool, int]:
+    """True when a scout marker can land before arrival and still be valid at arrival."""
+    marker_needed = max(3.0, travel * 0.5)
+    if _has_viable_own_scout_marker(inquire_nodes, target_id, my_team_id, marker_needed):
+        return False, 0
+    if travel > CORRIDOR_SCOUT_MAX_TRAVEL:
+        return False, 0
+    delay = _estimate_squad_scout_delay(graph, current_node_id, target_id, weather)
+    if travel <= delay:
+        return False, delay
+    if travel > delay + SCOUT_MARKER_VALID_FRAMES - 5:
+        return False, delay
+    return True, delay
+
+
+def _pick_corridor_entry_scout_target(
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    player: dict,
+    weather: dict | None,
+    obstacle_nodes: set[str] | None,
+    process_nodes: dict[str, dict] | None,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+) -> tuple[str, float, int] | None:
+    """Pick S14/S13 (etc.) within the 45-frame marker window while in the gate corridor."""
+    if not graph or not current_node_id or not gate_node_id:
+        return None
+    if current_node_id not in GATE_CORRIDOR_NODES:
+        return None
+    for target in _corridor_scout_target_order(gate_node_id, player):
+        if target == current_node_id:
+            continue
+        travel = _estimate_travel_frames(
+            graph, current_node_id, target, weather, obstacle_nodes, process_nodes,
+        )
+        if travel == float("inf"):
+            continue
+        ok, delay = _scout_timing_viable(
+            graph, current_node_id, target, travel, weather, inquire_nodes, my_team_id,
+        )
+        if ok:
+            return target, travel, delay
+    return None
+
+
+def _build_corridor_entry_scout_action(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    weather: dict | None,
+    phase: str,
+    inquire_nodes: list[dict],
+    process_nodes: dict[str, dict] | None,
+    obstacle_nodes: set[str] | None,
+    map_gameplay: MapGameplayContext | None = None,
+) -> dict | None:
+    """INTEL (≤15) or SQUAD_SCOUT for corridor nodes arriving within marker TTL."""
+    if phase == "RUSH" or is_delivered(player) or is_retired(player):
+        return None
+    if not current_node_id or not gate_node_id:
+        return None
+    if is_in_passive_state(player) or player.get("state") == "CONTESTING":
+        return None
+    my_team_id = get_team_id(player)
+    pick = _pick_corridor_entry_scout_target(
+        graph, current_node_id, gate_node_id, player, weather,
+        obstacle_nodes, process_nodes, inquire_nodes, my_team_id,
+    )
+    if not pick:
+        return None
+    target, travel, delay = pick
+    route_dist = graph.min_route_distance(
+        current_node_id, target, weather, obstacle_nodes,
+    )
+    prof = _profile(map_gameplay)
+    if (
+        prof.intel_enabled
+        and has_resource(player, "INTEL")
+        and route_dist <= INTEL_MAX_DISTANCE
+    ):
+        logger.info(
+            "Round %d: Corridor INTEL scout %s (eta=%.0f, routeDist=%.1f)",
+            round_num, target, travel, route_dist,
+        )
+        return make_action(match_id, round_num, player_id, [
+            make_use_resource_action("INTEL", target)
+        ])
+    if get_squad_count(player) < CORRIDOR_SCOUT_MIN_SQUAD:
+        return None
+    logger.info(
+        "Round %d: Corridor squad scout %s (eta=%.0f, delay=%d)",
+        round_num, target, travel, delay,
+    )
+    return make_action(match_id, round_num, player_id, [
+        make_squad_scout_action(target)
+    ])
+
+
+def _maybe_append_corridor_entry_scout(
+    action_msg: dict,
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    graph: MapGraph | None,
+    current_node_id: str,
+    gate_node_id: str,
+    weather: dict | None,
+    phase: str,
+    inquire_nodes: list[dict],
+    process_nodes: dict[str, dict] | None,
+    obstacle_nodes: set[str] | None,
+    map_gameplay: MapGameplayContext | None = None,
+) -> dict:
+    """Append corridor scout during force delivery / navigation without blocking main action."""
+    if not graph or not current_node_id or not gate_node_id:
+        return action_msg
+    if phase == "RUSH" or is_retired(player) or is_delivered(player):
+        return action_msg
+    if is_in_passive_state(player) or player.get("state") == "CONTESTING":
+        return action_msg
+    actions = action_msg.get("msg_data", {}).get("actions", [])
+    if len(actions) >= 2:
+        return action_msg
+    if any(a.get("action", "").startswith("SQUAD_") for a in actions):
+        return action_msg
+    if any(a.get("action") == "USE_RESOURCE" and a.get("resourceType") == "INTEL" for a in actions):
+        return action_msg
+    pick = _pick_corridor_entry_scout_target(
+        graph, current_node_id, gate_node_id, player, weather,
+        obstacle_nodes, process_nodes, inquire_nodes, get_team_id(player),
+    )
+    if not pick:
+        return action_msg
+    target, travel, delay = pick
+    route_dist = graph.min_route_distance(
+        current_node_id, target, weather, obstacle_nodes,
+    )
+    prof = _profile(map_gameplay)
+    if (
+        prof.intel_enabled
+        and has_resource(player, "INTEL")
+        and route_dist <= INTEL_MAX_DISTANCE
+        and not any(a.get("action") == "USE_RESOURCE" for a in actions)
+    ):
+        logger.info(
+            "Round %d: Corridor INTEL scout append at %s (eta=%.0f)",
+            round_num, target, travel,
+        )
+        return _append_squad_action(
+            action_msg, make_use_resource_action("INTEL", target),
+        )
+    if get_squad_count(player) < CORRIDOR_SCOUT_MIN_SQUAD:
+        return action_msg
+    logger.info(
+        "Round %d: Corridor squad scout append at %s (eta=%.0f, delay=%d)",
+        round_num, target, travel, delay,
+    )
+    return _append_squad_action(action_msg, make_squad_scout_action(target))
+
+
 def decide_action(
     match_id: str,
     round_num: int,
@@ -674,7 +913,7 @@ def decide_action(
             if is_enemy_guard(guard, my_team_id, player_id):
                 continue
             obstacle_nodes.add(nid)
-        return _maybe_append_gate_corridor_squad_clear(
+        action_msg = _maybe_append_gate_corridor_squad_clear(
             action_msg, player, phase, inquire_nodes, squad_clear_pending, round_num,
             graph, current_node_id, gate_node_id, weather, map_gameplay,
             force_delivery=append_force_delivery,
@@ -683,6 +922,12 @@ def decide_action(
             failed_task_ids=failed_task_ids,
             opp_player=opp_player,
         )
+        action_msg = _maybe_append_corridor_entry_scout(
+            action_msg, match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, weather, phase, inquire_nodes,
+            process_nodes, obstacle_nodes, map_gameplay,
+        )
+        return action_msg
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
         return make_empty_action(match_id, round_num, player_id)
@@ -844,7 +1089,7 @@ def _decide_action_impl(
             ):
                 if phase != "RUSH":
                     retreat = _try_step_back_from_pre_rush_gate(
-                        match_id, round_num, player_id, graph,
+                        match_id, round_num, player_id, graph, player,
                         current_node_id, gate_node_id, terminal_node_ids, weather,
                         process_nodes=process_nodes,
                         processed_node_ids=processed_node_ids,
@@ -859,7 +1104,7 @@ def _decide_action_impl(
                     )
                     return make_empty_action(match_id, round_num, player_id)
                 recover = _try_recover_gate_waiting(
-                    match_id, round_num, player_id, graph,
+                    match_id, round_num, player_id, player, graph,
                     current_node_id, gate_node_id, terminal_node_ids, weather,
                     own_guard_sites=own_guard_sites,
                     process_nodes=process_nodes,
@@ -974,6 +1219,12 @@ def _decide_action_impl(
                         )
                         return make_action(match_id, round_num, player_id, [make_move_action(detour)])
                     return make_action(match_id, round_num, player_id, [make_wait_action()])
+                if is_reverse_move_blocked(player, next_node):
+                    logger.info(
+                        "Round %d: WAITING cannot reverse to %s, sending WAIT",
+                        round_num, next_node,
+                    )
+                    return make_action(match_id, round_num, player_id, [make_wait_action()])
                 return make_action(match_id, round_num, player_id, [make_move_action(next_node)])
             if current_node_id:
                 move_target = _find_move_target(
@@ -1000,8 +1251,8 @@ def _decide_action_impl(
                 player, gate_node_id, current_node_id, last_move_failed, last_move_error,
             ):
                 logger.info(
-                    "Round %d: MOVING at unverified gate %s, WAIT for IDLE verify",
-                    round_num, current_node_id,
+                    "Round %d: MOVING toward unverified gate %s, WAIT until IDLE verify",
+                    round_num, gate_node_id,
                 )
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
             if guard_target or (
@@ -1120,7 +1371,7 @@ def _decide_action_impl(
                 phase, verify_gate_plain_only=verify_gate_plain_only,
             )
         retreat = _try_step_back_from_pre_rush_gate(
-            match_id, round_num, player_id, graph,
+            match_id, round_num, player_id, graph, player,
             current_node_id, gate_node_id, terminal_node_ids, weather,
             process_nodes=process_nodes,
             processed_node_ids=processed_node_ids,
@@ -1965,9 +2216,10 @@ def _find_direct_delivery_step(
     round_num: int = 0,
     phase: str = "",
 ) -> str | None:
-    goal_node = _get_goal_node(
+    goal_node = _resolve_navigation_goal(
         player, gate_node_id, terminal_node_ids, graph,
         current_node_id, weather, None, process_nodes,
+        round_num=round_num, phase=phase,
     )
     if not goal_node:
         return None
@@ -2188,7 +2440,7 @@ def _plan_limited_state_force_delivery_move(
 ) -> dict | None:
     """WAITING/MOVING 下 force delivery：仅 MOVE/WAIT/马类（任务书 §8.2）。"""
     retreat = _try_step_back_from_pre_rush_gate(
-        match_id, round_num, player_id, graph,
+        match_id, round_num, player_id, graph, player,
         current_node_id, gate_node_id, terminal_node_ids, weather,
         process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
@@ -2278,7 +2530,7 @@ def _plan_force_delivery_move(
 ) -> dict | None:
     """Resolve the next force-delivery hop, including detour and guard handling."""
     retreat = _try_step_back_from_pre_rush_gate(
-        match_id, round_num, player_id, graph,
+        match_id, round_num, player_id, graph, player,
         current_node_id, gate_node_id, terminal_node_ids, weather,
         process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
@@ -3235,15 +3487,18 @@ def _find_move_target(
         available = [n for n in available if n not in pre_rush_block]
         all_safe = [n for n in all_safe if n not in pre_rush_block]
 
-    goal_node = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None, process_nodes)
-
-    # Build remaining process nodes (exclude already-processed nodes at current visit)
     remaining_process_nodes = None
     if process_nodes:
         remaining_process_nodes = {
             nid: info for nid, info in process_nodes.items()
             if nid not in processed_node_ids
         }
+
+    goal_node = _resolve_navigation_goal(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, guard_blocked, remaining_process_nodes,
+        round_num=round_num, phase=phase,
+    )
 
     if goal_node:
         available = _filter_toward_goal_neighbors(
@@ -3349,7 +3604,9 @@ def _find_move_target(
             return best_alt
 
     # No goal: fall back to first available neighbor
-    return available[0]
+    if available:
+        available = [n for n in available if not is_reverse_move_blocked(player, n)]
+    return available[0] if available else None
 
 
 def _handle_contesting(
@@ -5871,6 +6128,14 @@ def _handle_combat(
                 return make_action(match_id, round_num, player_id, [
                     make_squad_clear_action(clear_target)
                 ])
+
+        corridor_scout = _build_corridor_entry_scout_action(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id or goal, weather, phase,
+            inquire_nodes, process_nodes, obstacle_nodes, map_gameplay,
+        )
+        if corridor_scout is not None:
+            return corridor_scout
 
         scout_action = _try_squad_scout(
             match_id, round_num, player_id, graph,
