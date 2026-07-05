@@ -43,7 +43,8 @@ from lychee_client.state import (
     GUARD_RESERVE_FOR_GATE, FINAL_CORRIDOR_GATE_HOPS,
     FINAL_CORRIDOR_GUARD_MIN_LEAD, FINAL_CORRIDOR_GUARD_TASK_MIN,
     GATE_DELAY_GUARD_MIN_OPP_HOPS, GATE_DELAY_GUARD_EXTRA_FRUIT,
-    ICE_BOX_NEAR_GATE_HOPS, GATE_ENTRY_DEADLINE_ROUND, GATE_ARRIVAL_TARGET_ROUND,
+    ICE_BOX_NEAR_GATE_HOPS,     GATE_ENTRY_DEADLINE_ROUND, GATE_ARRIVAL_TARGET_ROUND,
+    RUSH_MIN_ROUND, FORCE_DELIVERY_MIN_TASK_ROUND,
     EARLY_GAME_MAX_ROUND,
     SQUAD_CLEAR_MIN_ROUND, SQUAD_CLEAR_MIDMAP_MIN_ROUND, LATE_GAME_NO_MID_TASK_ROUND,
     SCOUT_MARKER_VALID_FRAMES, SQUAD_SCOUT_MIN_DELAY, SQUAD_SCOUT_MAX_DELAY,
@@ -129,6 +130,97 @@ def _must_wait_for_gate_verify(
     if last_move_failed and last_move_error == "VERIFY_REQUIRED":
         return True
     return not is_verified(player)
+
+
+def _should_hold_before_rush(round_num: int, phase: str) -> bool:
+    """RUSH opens at round 390 at earliest; do not enter S14 before then."""
+    return round_num < RUSH_MIN_ROUND and phase != "RUSH"
+
+
+def _pre_rush_gate_blocked(
+    gate_node_id: str, round_num: int, phase: str,
+) -> set[str]:
+    """Nodes that must not be entered before RUSH (typically S14)."""
+    if _should_hold_before_rush(round_num, phase) and gate_node_id:
+        return {gate_node_id}
+    return set()
+
+
+def _try_step_back_from_pre_rush_gate(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None = None,
+    processed_node_ids: set[str] | None = None,
+    avoid_nodes: set[str] | None = None,
+    phase: str = "",
+) -> dict | None:
+    """Leave S14 before RUSH to do corridor tasks instead of idling at the gate."""
+    if not _should_hold_before_rush(round_num, phase):
+        return None
+    if not gate_node_id or current_node_id != gate_node_id:
+        return None
+    step = _pick_gate_step_off_node(
+        graph, current_node_id, gate_node_id, terminal_node_ids, weather,
+        avoid_nodes=avoid_nodes,
+        process_nodes=process_nodes,
+        processed_node_ids=processed_node_ids,
+    )
+    if not step:
+        return None
+    logger.info(
+        "Round %d: pre-RUSH retreat from gate %s to %s for tasks/wait",
+        round_num, current_node_id, step,
+    )
+    return make_action(match_id, round_num, player_id, [make_move_action(step)])
+
+
+def _skip_corridor_process_for_gate_verify(
+    player: dict,
+    gate_node_id: str,
+    current_node_id: str | None,
+    phase: str,
+    process_type: str | None,
+    last_move_failed: bool,
+    last_move_error: str,
+) -> bool:
+    """Skip optional corridor PROCESS while recovering for gate verify."""
+    if not process_type or is_verify_process(process_type):
+        return False
+    if is_verified(player) or not gate_node_id or not current_node_id:
+        return False
+    if phase != "RUSH":
+        return False
+    if current_node_id not in GATE_CORRIDOR_NODES or current_node_id == gate_node_id:
+        return False
+    if last_move_failed and last_move_error == "PROCESS_REQUIRED":
+        return False
+    return True
+
+
+def _should_skip_water_task(
+    prefer_water: bool,
+    task_node: str,
+    task: dict,
+    current_node_id: str,
+    player: dict,
+    map_gameplay: MapGameplayContext | None,
+) -> bool:
+    """Skip water-bucket tasks unless already on the water route with low score."""
+    if prefer_water or not _is_water_task_location(task_node, task, map_gameplay):
+        return False
+    ctx = _map_ctx(map_gameplay)
+    if (
+        current_node_id in ctx.water_route_nodes
+        and get_task_score(player) < TASK_SCORE_TARGET
+    ):
+        return False
+    return True
 
 
 def _is_delivery_critical(
@@ -751,6 +843,16 @@ def _decide_action_impl(
                 player, gate_node_id, current_node_id, last_move_failed, last_move_error,
             ):
                 if phase != "RUSH":
+                    retreat = _try_step_back_from_pre_rush_gate(
+                        match_id, round_num, player_id, graph,
+                        current_node_id, gate_node_id, terminal_node_ids, weather,
+                        process_nodes=process_nodes,
+                        processed_node_ids=processed_node_ids,
+                        avoid_nodes=avoid_route_nodes,
+                        phase=phase,
+                    )
+                    if retreat is not None:
+                        return retreat
                     logger.info(
                         "Round %d: WAITING at unverified gate %s until RUSH, EMPTY heartbeat",
                         round_num, current_node_id,
@@ -835,6 +937,7 @@ def _decide_action_impl(
                     current_node_id, gate_node_id, terminal_node_ids,
                     weather, process_nodes, processed_node_ids,
                     route_blocked, avoid_route_nodes,
+                    phase=phase,
                 )
                 if move_action is not None:
                     return move_action
@@ -1016,6 +1119,16 @@ def _decide_action_impl(
                 gate_node_id, inquire_nodes, my_team_id, process_nodes,
                 phase, verify_gate_plain_only=verify_gate_plain_only,
             )
+        retreat = _try_step_back_from_pre_rush_gate(
+            match_id, round_num, player_id, graph,
+            current_node_id, gate_node_id, terminal_node_ids, weather,
+            process_nodes=process_nodes,
+            processed_node_ids=processed_node_ids,
+            avoid_nodes=avoid_route_nodes,
+            phase=phase,
+        )
+        if retreat is not None:
+            return retreat
         logger.info(
             "Round %d: at unverified gate %s before RUSH, EMPTY heartbeat",
             round_num, current_node_id,
@@ -1029,6 +1142,15 @@ def _decide_action_impl(
     already_processed_here = current_node_id in processed_node_ids
     process_type = None if already_processed_here else _get_process_type(current_node, process_nodes, current_node_id)
     if process_type and is_verify_process(process_type) and is_verified(player):
+        process_type = None
+    if _skip_corridor_process_for_gate_verify(
+        player, gate_node_id, current_node_id, phase, process_type,
+        last_move_failed, last_move_error,
+    ):
+        logger.info(
+            "Round %d: skip corridor process at %s during gate verify recovery",
+            round_num, current_node_id,
+        )
         process_type = None
 
     # 已验核且在宫门：稳妥做法——对手未到时先补拖延卡，否则直接前往终点
@@ -1271,6 +1393,7 @@ def _decide_action_impl(
             route_blocked, avoid_route_nodes, guard_stuck_rounds, guard_stuck_target,
             inquire_nodes, tasks, failed_task_ids, obstacle_nodes, my_team_id,
             forced_pass_failed_targets, last_move_failed, last_move_error,
+            phase=phase,
         )
         if move_action is not None:
             return move_action
@@ -1803,6 +1926,12 @@ def _should_force_delivery(
         return False
     if round_num < EARLY_GAME_MAX_ROUND and phase != "RUSH":
         return False
+    if (
+        get_task_score(player) < TASK_SCORE_TARGET
+        and round_num < FORCE_DELIVERY_MIN_TASK_ROUND
+        and phase != "RUSH"
+    ):
+        return False
     remaining = max(0, max_round - round_num)
     if remaining <= 0:
         return True
@@ -1833,6 +1962,8 @@ def _find_direct_delivery_step(
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
     avoid_nodes: set[str] | None = None,
+    round_num: int = 0,
+    phase: str = "",
 ) -> str | None:
     goal_node = _get_goal_node(
         player, gate_node_id, terminal_node_ids, graph,
@@ -1848,12 +1979,15 @@ def _find_direct_delivery_step(
             if nid not in processed_node_ids
         }
 
-    if avoid_nodes:
+    path_avoid = set(avoid_nodes or ())
+    path_avoid |= _pre_rush_gate_blocked(gate_node_id, round_num, phase)
+
+    if path_avoid:
         neighbors = graph.get_neighbors(current_node_id)
         best_step = None
         best_cost = float("inf")
         for neighbor in neighbors:
-            if neighbor in avoid_nodes:
+            if neighbor in path_avoid:
                 continue
             path = graph.weighted_shortest_path(
                 neighbor, goal_node, weather, None, remaining_process_nodes,
@@ -1875,14 +2009,16 @@ def _find_direct_delivery_step(
             return best_step
 
     step = graph.next_step_toward(
-        current_node_id, goal_node, weather, None,
+        current_node_id, goal_node, weather, path_avoid or None,
         use_weighted=True, process_nodes=remaining_process_nodes,
     )
-    if step and avoid_nodes and step in avoid_nodes:
+    if step and path_avoid and step in path_avoid:
         return None
     if step:
         return step
-    return graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
+    return graph.next_step_toward(
+        current_node_id, goal_node, weather, path_avoid or None, use_weighted=False,
+    )
 
 
 def _goal_path_cost(
@@ -2048,8 +2184,19 @@ def _plan_limited_state_force_delivery_move(
     processed_node_ids: set[str],
     route_blocked: set[str],
     avoid_route_nodes: set[str],
+    phase: str = "",
 ) -> dict | None:
     """WAITING/MOVING 下 force delivery：仅 MOVE/WAIT/马类（任务书 §8.2）。"""
+    retreat = _try_step_back_from_pre_rush_gate(
+        match_id, round_num, player_id, graph,
+        current_node_id, gate_node_id, terminal_node_ids, weather,
+        process_nodes=process_nodes,
+        processed_node_ids=processed_node_ids,
+        avoid_nodes=avoid_route_nodes,
+        phase=phase,
+    )
+    if retreat is not None:
+        return retreat
     if _must_wait_for_gate_verify(player, gate_node_id, current_node_id):
         logger.info(
             "Round %d: limited force delivery blocked at unverified gate %s, WAIT",
@@ -2070,6 +2217,7 @@ def _plan_limited_state_force_delivery_move(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
         avoid_nodes=avoid_route_nodes,
+        round_num=round_num, phase=phase,
     )
     if target and target not in route_blocked:
         horse_action = _use_horse_before_expensive_hop(
@@ -2126,8 +2274,19 @@ def _plan_force_delivery_move(
     last_move_error: str,
     *,
     log_prefix: str = "FORCE_DELIVERY",
+    phase: str = "",
 ) -> dict | None:
     """Resolve the next force-delivery hop, including detour and guard handling."""
+    retreat = _try_step_back_from_pre_rush_gate(
+        match_id, round_num, player_id, graph,
+        current_node_id, gate_node_id, terminal_node_ids, weather,
+        process_nodes=process_nodes,
+        processed_node_ids=processed_node_ids,
+        avoid_nodes=avoid_route_nodes,
+        phase=phase,
+    )
+    if retreat is not None:
+        return retreat
     path_avoid = set(avoid_route_nodes)
     if current_node_id not in GATE_CORRIDOR_NODES:
         # 入关走廊障碍应 FORCED_PASS/CLEAR，不应绕到 S08 等折返山路
@@ -2136,6 +2295,7 @@ def _plan_force_delivery_move(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, process_nodes, processed_node_ids,
         avoid_nodes=path_avoid,
+        round_num=round_num, phase=phase,
     )
     target = direct_target
     detour = False
@@ -3070,6 +3230,11 @@ def _find_move_target(
     if enemy_busy_task_ids is None:
         enemy_busy_task_ids = set()
 
+    pre_rush_block = _pre_rush_gate_blocked(gate_node_id, round_num, phase)
+    if pre_rush_block:
+        available = [n for n in available if n not in pre_rush_block]
+        all_safe = [n for n in all_safe if n not in pre_rush_block]
+
     goal_node = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None, process_nodes)
 
     # Build remaining process nodes (exclude already-processed nodes at current visit)
@@ -3112,6 +3277,7 @@ def _find_move_target(
         step = _find_direct_delivery_step(
             graph, current_node_id, player, gate_node_id, terminal_node_ids,
             weather, process_nodes, processed_node_ids,
+            round_num=round_num, phase=phase,
         )
         if step:
             return step
@@ -3148,6 +3314,7 @@ def _find_move_target(
         soft_blocked = set(obstacle_nodes)
         soft_blocked.update(visited_node_ids)
         soft_blocked.update(guard_blocked)
+        soft_blocked.update(pre_rush_block)
         # Don't block the goal itself
         soft_blocked.discard(goal_node)
 
@@ -3809,7 +3976,9 @@ def _retry_task_at_current_node(
         map_gameplay=map_gameplay,
     )
     task_node = task.get("nodeId", current_node_id)
-    if not prefer_water and _is_water_task_location(task_node, task, map_gameplay):
+    if _should_skip_water_task(
+        prefer_water, task_node, task, current_node_id, player, map_gameplay,
+    ):
         logger.info(
             "Round %d: Skip retry water task %s at %s (waterScore<%d)",
             round_num, task_id, task_node, _water_task_min(map_gameplay),
@@ -3928,7 +4097,9 @@ def _handle_tasks(
             task = None
         if task and not prefer_water:
             task_node = task.get("nodeId", "")
-            if _is_water_task_location(task_node, task, map_gameplay):
+            if _should_skip_water_task(
+                prefer_water, task_node, task, current_node_id, player, map_gameplay,
+            ):
                 logger.info(
                     "Round %d: Skip water task %s at %s (waterScore<%d)",
                     round_num, task.get("taskId", ""), task_node, _water_task_min(map_gameplay),
@@ -4062,9 +4233,8 @@ def _handle_tasks(
                     round_num, task.get("taskId", ""), task_node,
                 )
                 continue
-            if not prefer_water and (
-                task_node in _map_ctx(map_gameplay).water_route_nodes
-                or (task.get("routeBucket") or "ROAD") == "WATER"
+            if _should_skip_water_task(
+                prefer_water, task_node, task, current_node_id, player, map_gameplay,
             ):
                 continue
             # Score per round priority (策略文档 §5.1)
@@ -4789,6 +4959,7 @@ def _handle_use_resources(
             graph, current_node_id, player, gate_node_id,
             terminal_node_ids or [], weather, process_nodes,
             processed_node_ids or set(),
+            round_num=round_num, phase=phase,
         )
         if direct_target:
             horse_action = _use_horse_before_expensive_hop(
@@ -4799,8 +4970,9 @@ def _handle_use_resources(
             if horse_action is not None:
                 return horse_action
     elif graph and gate_node_id and current_node_id:
+        pre_rush_block = _pre_rush_gate_blocked(gate_node_id, round_num, phase)
         next_step = graph.next_step_toward(
-            current_node_id, gate_node_id, weather, None,
+            current_node_id, gate_node_id, weather, pre_rush_block or None,
             use_weighted=True, process_nodes=process_nodes,
         )
         if next_step:
