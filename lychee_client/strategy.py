@@ -198,6 +198,120 @@ def _make_verify_gate_with_tactic(
     return make_action(match_id, round_num, player_id, [action])
 
 
+def _try_break_enemy_guard_at_node(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    node_id: str,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    phase: str,
+) -> dict | None:
+    """BREAK_GUARD on an active enemy guard occupying node_id (e.g. gate S14)."""
+    guard = _get_node_guard(inquire_nodes, node_id)
+    if not is_enemy_guard(guard, my_team_id, player_id):
+        return None
+    if guard.get("defense", 0) <= 0:
+        return None
+    good, bad = _break_guard_investment(player)
+    if good + bad <= 0:
+        return None
+    action = make_break_guard_action(node_id, good_fruit=good, bad_fruit=bad)
+    rush_used = int(player.get("rushTacticUsedCount", 0) or 0)
+    if phase == "RUSH" and rush_used == 0 and (bad >= 2 or get_good_fruit(player) >= 2):
+        action["rushTactic"] = "BREAK_ORDER"
+        logger.info(
+            "Round %d: Breaking enemy guard at %s with BREAK_ORDER before gate verify",
+            round_num, node_id,
+        )
+    else:
+        logger.info(
+            "Round %d: Breaking enemy guard at %s before gate verify",
+            round_num, node_id,
+        )
+    return make_action(match_id, round_num, player_id, [action])
+
+
+def _pick_gate_step_off_node(
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+) -> str | None:
+    """Pick a non-terminal neighbor to leave the gate and regain IDLE."""
+    terminal_set = set(terminal_node_ids or [])
+    candidates = [
+        nb for nb in graph.get_neighbors(current_node_id)
+        if nb not in terminal_set
+    ]
+    if not candidates:
+        return None
+    best = candidates[0]
+    best_dist = -1.0
+    for nb in candidates:
+        dist = graph.path_length(nb, gate_node_id, weather, None)
+        if dist == float("inf"):
+            continue
+        if dist > best_dist:
+            best_dist = dist
+            best = nb
+    return best
+
+
+def _try_recover_gate_waiting(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+) -> dict | None:
+    """VERIFY_GATE is IDLE-only; MOVE off the gate to escape WAITING deadlock."""
+    if not graph or not current_node_id or current_node_id != gate_node_id:
+        return None
+    step = _pick_gate_step_off_node(
+        graph, current_node_id, gate_node_id, terminal_node_ids, weather,
+    )
+    if not step:
+        return None
+    logger.info(
+        "Round %d: WAITING at unverified gate %s, MOVE to %s to regain IDLE for verify",
+        round_num, current_node_id, step,
+    )
+    return make_action(match_id, round_num, player_id, [make_move_action(step)])
+
+
+def _decide_gate_verify_action(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    current_node_id: str,
+    gate_node_id: str,
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    process_nodes: dict[str, dict] | None,
+    phase: str,
+    verify_gate_plain_only: bool = False,
+) -> dict:
+    """Break enemy gate guard if needed, otherwise submit VERIFY_GATE."""
+    break_action = _try_break_enemy_guard_at_node(
+        match_id, round_num, player_id, player, current_node_id,
+        inquire_nodes, my_team_id, phase,
+    )
+    if break_action is not None:
+        return break_action
+    return _make_verify_gate_with_tactic(
+        match_id, round_num, player_id, player, current_node_id,
+        gate_node_id, inquire_nodes, my_team_id, process_nodes,
+        verify_gate_plain_only=verify_gate_plain_only,
+    )
+
+
 def _break_guard_investment(player: dict, reserve_good_fruit: int = 1) -> tuple[int, int]:
     """Choose BREAK_GUARD fruit while preserving at least one good fruit for delivery."""
     bad = min(get_bad_fruit(player), 2)
@@ -628,25 +742,19 @@ def _decide_action_impl(
             if _must_wait_for_gate_verify(
                 player, gate_node_id, current_node_id, last_move_failed, last_move_error,
             ):
-                if last_move_failed and last_move_error == "OBJECT_BUSY":
-                    logger.info(
-                        "Round %d: gate verify busy at %s, WAIT before retry",
-                        round_num, current_node_id,
-                    )
-                    return make_action(match_id, round_num, player_id, [make_wait_action()])
-                # VERIFY_GATE is IDLE-only (任务书 §8.2); use EMPTY heartbeat so
-                # WAITING can transition back to IDLE (WAIT would keep WAITING forever).
-                if phase == "RUSH":
-                    logger.info(
-                        "Round %d: WAITING at unverified gate %s in RUSH, "
-                        "EMPTY for IDLE verify (last=%s)",
-                        round_num, current_node_id, last_move_error or "pending",
-                    )
-                else:
+                if phase != "RUSH":
                     logger.info(
                         "Round %d: WAITING at unverified gate %s until RUSH, EMPTY heartbeat",
                         round_num, current_node_id,
                     )
+                    return make_empty_action(match_id, round_num, player_id)
+                # VERIFY_GATE is IDLE-only; WAIT/EMPTY never leave WAITING — step off gate.
+                recover = _try_recover_gate_waiting(
+                    match_id, round_num, player_id, graph,
+                    current_node_id, gate_node_id, terminal_node_ids, weather,
+                )
+                if recover is not None:
+                    return recover
                 return make_empty_action(match_id, round_num, player_id)
 
             pending_process_type = _get_pending_station_process_type(
@@ -884,10 +992,10 @@ def _decide_action_impl(
         player, gate_node_id, current_node_id, last_move_failed, last_move_error,
     ):
         if phase == "RUSH":
-            return _make_verify_gate_with_tactic(
+            return _decide_gate_verify_action(
                 match_id, round_num, player_id, player, current_node_id,
                 gate_node_id, inquire_nodes, my_team_id, process_nodes,
-                verify_gate_plain_only=verify_gate_plain_only,
+                phase, verify_gate_plain_only=verify_gate_plain_only,
             )
         logger.info(
             "Round %d: at unverified gate %s before RUSH, EMPTY heartbeat",
@@ -968,6 +1076,19 @@ def _decide_action_impl(
 
     # --- Handle OBJECT_BUSY: wait one round and retry ---
     if last_move_failed and last_move_error == "OBJECT_BUSY":
+        if (
+            gate_node_id
+            and current_node_id == gate_node_id
+            and _must_wait_for_gate_verify(
+                player, gate_node_id, current_node_id, last_move_failed, last_move_error,
+            )
+            and phase == "RUSH"
+        ):
+            return _decide_gate_verify_action(
+                match_id, round_num, player_id, player, current_node_id,
+                gate_node_id, inquire_nodes, my_team_id, process_nodes,
+                phase, verify_gate_plain_only=verify_gate_plain_only,
+            )
         # The process target is busy (e.g., window contest just ended, still transitioning)
         # Wait one round, then retry process on next round
         logger.info("Round %d: OBJECT_BUSY, waiting", round_num)
@@ -5070,7 +5191,7 @@ def _evaluate_dual_guard_slot(
         return False, "already-guarded"
     task_score = get_task_score(player)
     if not _guard_good_fruit_sufficient(
-        player, inquire_nodes, current_node_id, task_score, gate_node_id,
+        player, inquire_nodes, current_node_id, task_score, goal,
     ):
         return False, "low-fruit"
     if not _is_key_choke_node(graph, current_node_id):
